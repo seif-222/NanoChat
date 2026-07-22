@@ -7,6 +7,7 @@ import numpy as np
 
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
+from flash_attn import flash_attn_func
 import torch.distributed as dist
 
 from dataclasses import dataclass
@@ -88,10 +89,12 @@ class GPT_config:
     #compile
     use_compile: bool = False                # note: compile breaks HellaSwag/gen
     ### RoPE
-    base:int = 10000
+    base: int = 10000
     ## For GQA
-    n_kv_head:int = 2
-
+    n_kv_head: int = 2
+    ### Sliding window
+    mask_pattern: str = 'SSL'
+    window_size: int = 32
 
 
 
@@ -243,9 +246,11 @@ class CausalMultiHeadAttention(nn.Module):
     self.n_head = config.n_head
     self.n_embd = config.n_embd
     self.n_kv_head = config.n_kv_head
+    self.window_size = config.window_size
     # assert errors
     assert self.n_head % self.n_kv_head == 0, f"n_head: {self.n_head}, n_kv_head: {self.n_kv_head} Aren't Divisible"
-    assert self.n_embd % self.n_head == 0, "number of heads must be a multiple of n_head"
+    assert self.n_embd % self.n_head == 0, f"Number of Embeddings: {self.n_embd},  must be a multiple of n_head: {self.n_head}"
+    assert self.window_size <= config.block_size , f'Window size: {self.window_size} should be <= block_size: {config.block_size}'
     # Group and Head size
     self.head_sz = self.n_embd // self.n_head
     self.group_sz = self.n_head // self.n_kv_head
@@ -257,7 +262,7 @@ class CausalMultiHeadAttention(nn.Module):
     self.c_proj.INIT_SPECIAL_STD = 1
 
 
-  def forward(self, x): # x -> (B, T, E)
+  def forward(self, x, char): # x -> (B, T, E)
     # shapes
     b,t,c = x.shape
     # get qkv
@@ -276,10 +281,18 @@ class CausalMultiHeadAttention(nn.Module):
     # Expanding the k,v to match the number of heads
     k = k.unsqueeze(2).expand(-1, -1, self.group_sz, -1, -1).reshape(b, self.n_head, t, -1)   #  -> (B, n_head, T, head_sz)
     v = v.unsqueeze(2).expand(-1, -1, self.group_sz, -1, -1).reshape(b, self.n_head, t, -1)
-    # Run FlashAttention
-    wei = F.scaled_dot_product_attention(q, k, v, is_causal=True) # is_casual=True -> causal mask is the triangular mask we built manually with torch.tril + masked_fill.
-    # Combine the heads back
-    wei = wei.transpose(1,2).reshape(b, t, c)
+
+    # Run FlashAttention (IF char == L)
+    if char == 'L':
+        wei = F.scaled_dot_product_attention(q, k, v, is_causal=True) # is_casual=True -> causal mask is the triangular mask we built manually with torch.tril + masked_fill.
+        wei = wei.transpose(1, 2).reshape(b, t, c)                    # Combine the heads back
+
+    # Run FlashAttention (IF char == S)
+    if char == 'S' :
+        q,k,v = q.transpose(1,2), k.transpose(1,2), v.transpose(1,2)  # Because the flash_attn_func expects -> (B, T, n_head, head_sz) not (B, n_head, T, head_sz)
+        wei = flash_attn_func(q, k, v, causal=True, window_size=(self.window_size,0)) #  (left=window, right=0) -> only look back window tokens, never forward | causal=True is already what blocks future tokens but Both together are redundant but harmless.
+        wei = wei.reshape(b, t, c)                                    # Combine the heads back
+
     # return the projection
     return self.c_proj(wei)
 
@@ -302,15 +315,24 @@ class Block(nn.Module):
     self.mlp = MLP(config)
     self.ln_1 = nn.LayerNorm(config.n_embd)
     self.ln_2 = nn.LayerNorm(config.n_embd)
-  def forward(self, x):
-    x = x + self.attn(self.ln_1(x))
+  def forward(self, x, char):
+    x = x + self.attn(self.ln_1(x), char)
     return x + self.mlp(self.ln_2(x))
 
 
 class GPT(nn.Module):
   def __init__(self, config):
     super().__init__()
+    # save attr
     self.config = config
+
+    # Expand the attention masking pattern & assert & Make mask UpperCase
+    config.mask_pattern = config.mask_pattern.upper()
+    assert config.n_layer >= len(config.mask_pattern), f'n_layer:{config.n_layer}  must be >= len(mask_pattern):{len(config.mask_pattern)}'
+    assert all(c in 'SL' for c in config.mask_pattern), f'All chars in mask pattern: {config.mask_pattern} should be -> S or L'
+    self.att_mask_patt = (config.n_layer * config.mask_pattern)[:config.n_layer - 1] + 'L'
+
+    # Make the Transformer & Head
     self.transformer = nn.ModuleDict(dict(
       wte = nn.Embedding(config.vocab_size, config.n_embd),
       h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
@@ -318,10 +340,10 @@ class GPT(nn.Module):
     ))
     self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    ## MAKE the last Linear later the same as the embedding layer
+    # Make the last Linear later the same as the embedding layer
     self.lm_head.weight = self.transformer.wte.weight
 
-    ## APPLY Initialization
+    # Apply Initialization
     self.apply(self._initalization)
 
   ## Make Initialization function
@@ -340,7 +362,7 @@ class GPT(nn.Module):
 
     x =  self.transformer.wte(x) # x -> (B, tokens, embs)
 
-    for layer in self.transformer.h: x = layer(x)
+    for layer, char in zip(self.transformer.h, self.att_mask_patt):   x = layer(x, char)
 
     x = self.transformer.ln_f(x)
 
