@@ -269,6 +269,8 @@ class CausalMultiHeadAttention(nn.Module):
     # wei = F.softmax(wei, -1)
     # wei = wei @ v
     q,k = self.rope(q), self.rope(k)
+    q,k = norm(q), norm(k)   # Normalization
+    q,k = q * 1.2 , k * 1.2  # Rescaling
     wei = F.scaled_dot_product_attention(q, k, v, is_causal=True) # is_casual=True -> causal mask is the triangular mask we built manually with torch.tril + masked_fill.
     wei = head_batch(wei, self.n_head)
     return self.c_proj(wei)
@@ -278,11 +280,10 @@ class MLP(nn.Module):
   def __init__(self, config):
     super().__init__()
     self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
-    self.gelu    = nn.GELU(approximate='tanh')
     self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
     self.c_proj.INIT_SPECIAL_STD = 1
   def forward(self, x):
-    return self.c_proj(self.gelu(self.c_fc(x)))
+    return self.c_proj(F.relu(self.c_fc(x)).square())   # Made the Avtivation as the ReLU^2
 
 
 
