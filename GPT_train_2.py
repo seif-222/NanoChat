@@ -89,6 +89,8 @@ class GPT_config:
     use_compile: bool = False                # note: compile breaks HellaSwag/gen
     ### RoPE
     base:int = 10000
+    ## For GQA
+    n_kv_head:int = 2
 
 
 
@@ -190,9 +192,6 @@ class RoPE(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        head_dim = config.n_embd // config.n_head
-        inv_freq = self._create_inv_freq(head_dim, config.base)
-        self.register_buffer('inv_freq', inv_freq)
 
     def _create_inv_freq(self, head_dim, base=10000):
         dim = head_dim // 2
@@ -219,8 +218,11 @@ class RoPE(nn.Module):
         return torch.cat([y1, y2], dim=-1)
 
     def forward(self, x):
+        # Get the dims & device
+        n_head_dim = x.shape[-1]
         seq_len = x.shape[-2]
-        angles = self._create_angles(self.inv_freq, seq_len)
+        # create angles
+        angles = self._create_angles(self._create_inv_freq(n_head_dim, self.config.base).to(x.device),  seq_len)
         angles = angles.unsqueeze(0)
         return self._rotation(x, angles)
 
@@ -228,51 +230,57 @@ class RoPE(nn.Module):
 ####_________________________ NORMALIZATION FUNC___________________________
 
 def norm(x, eps=1e-6):
-    return F.rms_norm(x, x.shape[-1], eps)  # RMS normalization with epsilon for numerical stability
+    return F.rms_norm(x, (x.shape[-1],), weight=None,  eps=eps)  # RMS normalization with epsilon for numerical stability
 
 
 ###_________________________ CREATING THE MODEL _______________________________________
 
-def batch_head(x, n_head):
-  b,t,c = x.shape
-  x = x.reshape(b, t, n_head,-1)
-  return x.transpose(1,2).reshape(b*n_head, t, -1)
-
-def head_batch(x, n_head):
-    bn, t, c = x.shape
-    x = x.reshape(-1, n_head, t, c)
-    return x.transpose(1, 2).reshape(-1, t, n_head * c)
-
-
 class CausalMultiHeadAttention(nn.Module):
   def __init__(self, config):
     super().__init__()
+    # Save attr
+    self.rope = RoPE(config)
     self.n_head = config.n_head
     self.n_embd = config.n_embd
-    assert self.n_embd % config.n_head == 0, "number of heads must be a multiple of n_head"
-    self.head_sz = config.n_embd // config.n_head
-    self.c_attn = nn.Linear(self.n_embd, 3 * self.n_embd)
+    self.n_kv_head = config.n_kv_head
+    # assert errors
+    assert self.n_head % self.n_kv_head == 0, f"n_head: {self.n_head}, n_kv_head: {self.n_kv_head} Aren't Divisible"
+    assert self.n_embd % self.n_head == 0, "number of heads must be a multiple of n_head"
+    # Group and Head size
+    self.head_sz = self.n_embd // self.n_head
+    self.group_sz = self.n_head // self.n_kv_head
+    # qkv
+    self.q_proj = nn.Linear(self.n_embd, self.n_embd)
+    self.kv_proj = nn.Linear(self.n_embd, 2 * self.head_sz * self.n_kv_head)
+    # Projection
     self.c_proj = nn.Linear(self.n_embd,self.n_embd)
     self.c_proj.INIT_SPECIAL_STD = 1
-    # self.register_buffer('bias', torch.tril(torch.ones(config.block_size, config.block_size)))   # -> because we switched to Flash attention
-    self.rope = RoPE(config)
+
 
   def forward(self, x): # x -> (B, T, E)
+    # shapes
     b,t,c = x.shape
-    x = self.c_attn(x)
-    q, k, v = torch.chunk(x, 3, dim=-1) # we get the qkv first before batch_head because this is the order openai used(weights optimized for it), but reversing it when training a model from scratch is fine
-    q = batch_head(q, self.n_head) # (B, T, E)
-    k = batch_head(k, self.n_head) # (B, T, E)
-    v = batch_head(v, self.n_head) # (B, T, E)
-    # wei = q @ k.transpose(-1,-2) * self.head_sz**-0.5 # Scaling, shape (B, T, T)
-    # wei = wei.masked_fill(self.bias[:t,:t]==0, float('-inf'))
-    # wei = F.softmax(wei, -1)
-    # wei = wei @ v
+    # get qkv
+    q = self.q_proj(x)
+    kv = self.kv_proj(x)
+    k, v = torch.chunk(kv, 2, dim=-1)
+    # Make them 4D shaped
+    q = q.reshape(b, t, self.n_head,    self.head_sz).transpose(1, 2)  # -> (B, n_head, T, head_sz)
+    k = k.reshape(b, t, self.n_kv_head, self.head_sz).transpose(1, 2)  # -> (B, n_kv_head, T, head_sz)
+    v = v.reshape(b, t, self.n_kv_head, self.head_sz).transpose(1, 2)
+    # apply RoPE
     q,k = self.rope(q), self.rope(k)
-    q,k = norm(q), norm(k)   # Normalization
-    q,k = q * 1.2 , k * 1.2  # Rescaling
+    # Normalization & Rescaling
+    q,k = norm(q), norm(k)
+    q,k = q * 1.2 , k * 1.2
+    # Expanding the k,v to match the number of heads
+    k = k.unsqueeze(2).expand(-1, -1, self.group_sz, -1, -1).reshape(b, self.n_head, t, -1)   #  -> (B, n_head, T, head_sz)
+    v = v.unsqueeze(2).expand(-1, -1, self.group_sz, -1, -1).reshape(b, self.n_head, t, -1)
+    # Run FlashAttention
     wei = F.scaled_dot_product_attention(q, k, v, is_causal=True) # is_casual=True -> causal mask is the triangular mask we built manually with torch.tril + masked_fill.
-    wei = head_batch(wei, self.n_head)
+    # Combine the heads back
+    wei = wei.transpose(1,2).reshape(b, t, c)
+    # return the projection
     return self.c_proj(wei)
 
 
@@ -341,45 +349,6 @@ class GPT(nn.Module):
     if targets is not None:  loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1))
     return logits, loss
 
-  @classmethod
-  def from_pretrained(cls, model_name): #  cls -> the class it self can be called -> cls()
-    assert model_name in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}, f"{model_name} is not Valid" # make a set so that it is faster O(1)
-    from transformers import GPT2LMHeadModel
-    print(f'loading {model_name}')
-    configs ={
-        'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-        'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-        'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-        'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
-    }[model_name]
-    configs['vocab_size'] = 50257 # same in all of them
-    configs['block_size'] = 1024 # same in all of them
-
-    model_config = GPT_config(**configs)
-    model = cls(model_config)
-    sd = model.state_dict()
-    sd_keys = sd.keys()
-    sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
-
-    model_hf = GPT2LMHeadModel.from_pretrained(model_name) # load the hugging face model
-    sd_hf = model_hf.state_dict()
-    sd_keys_hf = sd_hf.keys()
-    sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
-    sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
-    transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight'] # openai checkpoints use a "Conv1D" module, but we only want to use a  Linear so we have to transpose these weights when we import them
-
-    assert len(sd_keys) == len(sd_keys_hf), f'Keys mismatch : {len(sd_keys_hf)} != {len(sd_keys)}'
-    for k in sd_keys_hf:
-        if any(k.endswith(w) for w in transposed):
-            assert sd_hf[k].shape[::-1] == sd[k].shape, f'shape mismatch Transposed if Conv-> {sd_hf[k].shape} != {sd[k].shape} at {k}'   # [::-1] reverse sequence e.g. (768, 3072) to (3072, 768)
-            with torch.no_grad():
-                sd[k].copy_(sd_hf[k].T)
-        else:
-            assert sd_hf[k].shape == sd[k].shape , f'shape mismatch {sd_hf[k].shape} != {sd[k].shape} at {k}'
-            with torch.no_grad():
-                sd[k].copy_(sd_hf[k])
-
-    return model
 
   def optimizers_config(self, device_type, optimizer=None):
     params_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
