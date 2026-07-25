@@ -95,8 +95,10 @@ class GPT_config:
     ### Sliding window
     mask_pattern: str = 'SSL'
     window_size: int = 32
-
-
+    ### Value Residual Injection
+    n_embd_gate:int = 24
+    Table_embds_per_layer: bool = True
+    ve_per_n_layers: int = 2    # how much do we want to apply it  (per n layers)
 
 ##_____________________________________ OPTIMIZER __________________________________
 
@@ -230,16 +232,20 @@ class RoPE(nn.Module):
         return self._rotation(x, angles)
 
 
-####_________________________ NORMALIZATION FUNC___________________________
+####_________________________ NORMALIZATION FUNC   &   VE FLAG BASED ON IDX,ETC... FUNC ___________________________
 
 def norm(x, eps=1e-6):
     return F.rms_norm(x, (x.shape[-1],), weight=None,  eps=eps)  # RMS normalization with epsilon for numerical stability
+
+def compute_ve_flag(layer_idx, n_layers, ve_per_n_layers):
+    is_alternating =   layer_idx % ve_per_n_layers == (n_layers - 1) % ve_per_n_layers
+    return is_alternating or layer_idx == (n_layers - 1)  # is alternating or the last layer
 
 
 ###_________________________ CREATING THE MODEL _______________________________________
 
 class CausalMultiHeadAttention(nn.Module):
-  def __init__(self, config):
+  def __init__(self, config, idx):
     super().__init__()
     # Save attr
     self.rope = RoPE(config)
@@ -247,10 +253,15 @@ class CausalMultiHeadAttention(nn.Module):
     self.n_embd = config.n_embd
     self.n_kv_head = config.n_kv_head
     self.window_size = config.window_size
+    self.n_embd_gate =  config.n_embd_gate
+    self.ATTN_IDX = idx
+    self.ve_flag = False
     # assert errors
     assert self.n_head % self.n_kv_head == 0, f"n_head: {self.n_head}, n_kv_head: {self.n_kv_head} Aren't Divisible"
     assert self.n_embd % self.n_head == 0, f"Number of Embeddings: {self.n_embd},  must be a multiple of n_head: {self.n_head}"
     assert self.window_size <= config.block_size , f'Window size: {self.window_size} should be <= block_size: {config.block_size}'
+    assert config.ve_per_n_layers <= config.n_layer, f"ve_per_n_layers: {config.ve_per_n_layers} can't be > {config.n_layer}"
+    if not config.Table_embds_per_layer : assert self.n_embd_gate <= self.n_embd, f'Number of Embeddings in Gate Residual: {self.n_embd_gate}  should be <= Number of Embeddings: {self.n_embd}'
     # Group and Head size
     self.head_sz = self.n_embd // self.n_head
     self.group_sz = self.n_head // self.n_kv_head
@@ -260,10 +271,15 @@ class CausalMultiHeadAttention(nn.Module):
     # Projection
     self.c_proj = nn.Linear(self.n_embd,self.n_embd)
     self.c_proj.INIT_SPECIAL_STD = 1
+    # Gate Linear & Embedding Table (if True) -> For the Value Embeddings / depending on n chosen for the frequency of ve
+    if compute_ve_flag(self.ATTN_IDX, config.n_layer, config.ve_per_n_layers):
+        self.ve_flag = True
+        if not config.Table_embds_per_layer : self.ve = nn.Linear(self.n_embd_gate, self.head_sz * self.n_kv_head)
+        if config.Table_embds_per_layer : self.ve = nn.Embedding(config.vocab_size, self.head_sz * self.n_kv_head)
+        self.ve_gate = nn.Linear(self.n_embd_gate, self.n_kv_head)
 
-
-  def forward(self, x, char): # x -> (B, T, E)
-    # shapes
+  def forward(self, x, char, x_ve_input): # x -> (B, T, E) | x_ve_input -> (token_indicies: in case of there is a ve_embd_table_per_layer),
+    # shapes                                                            -> (ve_embeddings: in case of there is a Global ve_embd_table)
     b,t,c = x.shape
     # get qkv
     q = self.q_proj(x)
@@ -272,7 +288,15 @@ class CausalMultiHeadAttention(nn.Module):
     # Make them 4D shaped
     q = q.reshape(b, t, self.n_head,    self.head_sz).transpose(1, 2)  # -> (B, n_head, T, head_sz)
     k = k.reshape(b, t, self.n_kv_head, self.head_sz).transpose(1, 2)  # -> (B, n_kv_head, T, head_sz)
-    v = v.reshape(b, t, self.n_kv_head, self.head_sz).transpose(1, 2)
+    v = v.reshape(b, t, self.n_kv_head, self.head_sz)   # -> (B, T, n_kv_head, head_sz), We are not going to transpose now to make VE work, then we transpose
+    # Add the Gate,ve to V
+    if self.ve_flag:
+        gate = 3 * torch.sigmoid(self.ve_gate(x[:,:,:self.n_embd_gate])) # -> (B,T,C[:n]) -> (B,T,n_kv_head)
+        if x_ve_input is not None:  ve = self.ve(x_ve_input).view(b, t, self.n_kv_head, self.head_sz) # (B,T, head_sz * n_kv_head) -> (B,T, n_kv_head, head_sz)
+        else: raise ValueError("Missing required inputs: You must provide either 'x_ve' or 'x_ve_indicies' For ValueEmbeddings to Work")
+        v = v + gate.unsqueeze(-1) * ve   # unsqueeze -> ( B, T, n_kv_head, 1)
+    # Transpose V
+    v = v.transpose(1, 2) # -> (B, n_kv_head, T, head_sz)
     # apply RoPE
     q,k = self.rope(q), self.rope(k)
     # Normalization & Rescaling
@@ -309,14 +333,14 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-  def __init__(self, config):
+  def __init__(self, config, idx):
     super().__init__()
-    self.attn = CausalMultiHeadAttention(config)
+    self.attn = CausalMultiHeadAttention(config, idx)
     self.mlp = MLP(config)
     self.ln_1 = nn.LayerNorm(config.n_embd)
     self.ln_2 = nn.LayerNorm(config.n_embd)
-  def forward(self, x, char):
-    x = x + self.attn(self.ln_1(x), char)
+  def forward(self, x, char, x_ve_input=None):
+    x = x + self.attn(self.ln_1(x), char, x_ve_input)
     return x + self.mlp(self.ln_2(x))
 
 
@@ -325,26 +349,30 @@ class GPT(nn.Module):
     super().__init__()
     # save attr
     self.config = config
-
     # Expand the attention masking pattern & assert & Make mask UpperCase
     config.mask_pattern = config.mask_pattern.upper()
     assert config.n_layer >= len(config.mask_pattern), f'n_layer:{config.n_layer}  must be >= len(mask_pattern):{len(config.mask_pattern)}'
     assert all(c in 'SL' for c in config.mask_pattern), f'All chars in mask pattern: {config.mask_pattern} should be -> S or L'
     self.att_mask_patt = (config.n_layer * config.mask_pattern)[:config.n_layer - 1] + 'L'
 
-    # Make the Transformer & Head
-    self.transformer = nn.ModuleDict(dict(
-      wte = nn.Embedding(config.vocab_size, config.n_embd),
-      h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-      ln_f = nn.LayerNorm(config.n_embd)
-    ))
+    # Make the Transformer
+    transformer_modules = {
+        'wte': nn.Embedding(config.vocab_size, config.n_embd),
+        'h': nn.ModuleList([Block(config, idx) for idx in range(config.n_layer)]),
+        'ln_f': nn.LayerNorm(config.n_embd)
+    }
+    # add ve_TableEmbedding if True
+    if not config.Table_embds_per_layer:
+        transformer_modules['ve_te'] = nn.Embedding(config.vocab_size, config.n_embd_gate)
+    # make the module
+    self.transformer = nn.ModuleDict(transformer_modules)
+    # Make the head
     self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-
     # Make the last Linear later the same as the embedding layer
     self.lm_head.weight = self.transformer.wte.weight
-
     # Apply Initialization
     self.apply(self._initalization)
+
 
   ## Make Initialization function
   def _initalization(self, module):
@@ -356,17 +384,22 @@ class GPT(nn.Module):
       elif isinstance(module, nn.Embedding):
           nn.init.normal_(module.weight, mean=0., std=0.02)
 
+
   def forward(self, x, targets=None): # x -> (B, Tokens)
+    # Shape & Assert
     B, T = x.shape
     assert T <= self.config.block_size, f'The Context Exceeds the block size {T} > {self.config.block_size}'
-
+    # get the VE_input
+    x_ve_input = self.transformer.ve_te(x) if 've_te' in self.transformer else x
+    # Tokens -> Embeddings
     x =  self.transformer.wte(x) # x -> (B, tokens, embs)
-
-    for layer, char in zip(self.transformer.h, self.att_mask_patt):   x = layer(x, char)
-
+    # Pass Input in Transformer Layers
+    for layer, char in zip(self.transformer.h, self.att_mask_patt):   x = layer(x, char, x_ve_input)
+    # Apply LayerNorm
     x = self.transformer.ln_f(x)
-
+    # lm_head -> Get Logits
     logits = self.lm_head(x)
+    # Return Loss, Logits
     loss = None
     if targets is not None:  loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1))
     return logits, loss
