@@ -99,6 +99,8 @@ class GPT_config:
     n_embd_gate:int = 24
     Table_embds_per_layer: bool = True
     ve_per_n_layers: int = 2    # how much do we want to apply it  (per n layers)
+    ### per layer scalars
+    num_per_layer_scalars: int = 1  # 1 is the default
 
 ##_____________________________________ OPTIMIZER __________________________________
 
@@ -232,7 +234,7 @@ class RoPE(nn.Module):
         return self._rotation(x, angles)
 
 
-####_________________________ NORMALIZATION FUNC   &   VE FLAG BASED ON IDX,ETC... FUNC ___________________________
+####_________________________ NORMALIZATION FUNC & (VE_FLAG BASED ON IDX,ETC... FUNC )___________________________
 
 def norm(x, eps=1e-6):
     return F.rms_norm(x, (x.shape[-1],), weight=None,  eps=eps)  # RMS normalization with epsilon for numerical stability
@@ -354,7 +356,11 @@ class GPT(nn.Module):
     assert config.n_layer >= len(config.mask_pattern), f'n_layer:{config.n_layer}  must be >= len(mask_pattern):{len(config.mask_pattern)}'
     assert all(c in 'SL' for c in config.mask_pattern), f'All chars in mask pattern: {config.mask_pattern} should be -> S or L'
     self.att_mask_patt = (config.n_layer * config.mask_pattern)[:config.n_layer - 1] + 'L'
-
+    # Per_Layer_Scalars -> assert & repetition_attr, etc...
+    self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer, config.num_per_layer_scalars))
+    self.x0_lambdas =  nn.Parameter(torch.zeros(config.n_layer, config.num_per_layer_scalars))
+    assert config.n_embd % config.num_per_layer_scalars == 0, f"num_per_layer_scalars: {config.num_per_layer_scalars}  Must be <=  n_emb: {config.n_embd}  && n_emb: {config.n_embd} should be divisible by num_per_layer_scalars: {config.num_per_layer_scalars}"
+    self.repetition = config.n_embd // config.num_per_layer_scalars
     # Make the Transformer
     transformer_modules = {
         'wte': nn.Embedding(config.vocab_size, config.n_embd),
@@ -394,7 +400,12 @@ class GPT(nn.Module):
     # Tokens -> Embeddings
     x =  self.transformer.wte(x) # x -> (B, tokens, embs)
     # Pass Input in Transformer Layers
-    for layer, char in zip(self.transformer.h, self.att_mask_patt):   x = layer(x, char, x_ve_input)
+    x0 = x.clone() # Save x0
+    for i, (layer, char) in enumerate(zip(self.transformer.h, self.att_mask_patt)):
+        resid_lambdas = self.resid_lambdas[i].repeat(self.repetition)
+        x0_lambdas = self.x0_lambdas[i].repeat(self.repetition)
+        x = resid_lambdas * x + x0_lambdas * x0
+        x = layer(x, char, x_ve_input)
     # Apply LayerNorm
     x = self.transformer.ln_f(x)
     # lm_head -> Get Logits
