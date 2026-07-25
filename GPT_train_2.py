@@ -96,11 +96,14 @@ class GPT_config:
     mask_pattern: str = 'SSL'
     window_size: int = 32
     ### Value Residual Injection
-    n_embd_gate:int = 24
+    n_embd_ve_gate:int = 24
     Table_embds_per_layer: bool = True
     ve_per_n_layers: int = 2    # how much do we want to apply it  (per n layers)
     ### per layer scalars
     num_per_layer_scalars: int = 1  # 1 is the default
+    ### SmearGate
+    smear_gate_flag: bool = True
+    n_embd_smear_gate: int = 24
 
 ##_____________________________________ OPTIMIZER __________________________________
 
@@ -255,7 +258,7 @@ class CausalMultiHeadAttention(nn.Module):
     self.n_embd = config.n_embd
     self.n_kv_head = config.n_kv_head
     self.window_size = config.window_size
-    self.n_embd_gate =  config.n_embd_gate
+    self.n_embd_ve_gate =  config.n_embd_ve_gate
     self.ATTN_IDX = idx
     self.ve_flag = False
     # assert errors
@@ -263,7 +266,7 @@ class CausalMultiHeadAttention(nn.Module):
     assert self.n_embd % self.n_head == 0, f"Number of Embeddings: {self.n_embd},  must be a multiple of n_head: {self.n_head}"
     assert self.window_size <= config.block_size , f'Window size: {self.window_size} should be <= block_size: {config.block_size}'
     assert config.ve_per_n_layers <= config.n_layer, f"ve_per_n_layers: {config.ve_per_n_layers} can't be > {config.n_layer}"
-    if not config.Table_embds_per_layer : assert self.n_embd_gate <= self.n_embd, f'Number of Embeddings in Gate Residual: {self.n_embd_gate}  should be <= Number of Embeddings: {self.n_embd}'
+    if not config.Table_embds_per_layer : assert self.n_embd_ve_gate <= self.n_embd, f'Number of Embeddings in ve_Gate Residual: {self.n_embd_ve_gate}  should be <= Number of Embeddings: {self.n_embd}'
     # Group and Head size
     self.head_sz = self.n_embd // self.n_head
     self.group_sz = self.n_head // self.n_kv_head
@@ -276,9 +279,9 @@ class CausalMultiHeadAttention(nn.Module):
     # Gate Linear & Embedding Table (if True) -> For the Value Embeddings / depending on n chosen for the frequency of ve
     if compute_ve_flag(self.ATTN_IDX, config.n_layer, config.ve_per_n_layers):
         self.ve_flag = True
-        if not config.Table_embds_per_layer : self.ve = nn.Linear(self.n_embd_gate, self.head_sz * self.n_kv_head)
+        if not config.Table_embds_per_layer : self.ve = nn.Linear(self.n_embd_ve_gate, self.head_sz * self.n_kv_head)
         if config.Table_embds_per_layer : self.ve = nn.Embedding(config.vocab_size, self.head_sz * self.n_kv_head)
-        self.ve_gate = nn.Linear(self.n_embd_gate, self.n_kv_head)
+        self.ve_gate = nn.Linear(self.n_embd_ve_gate, self.n_kv_head)
 
   def forward(self, x, char, x_ve_input): # x -> (B, T, E) | x_ve_input -> (token_indicies: in case of there is a ve_embd_table_per_layer),
     # shapes                                                            -> (ve_embeddings: in case of there is a Global ve_embd_table)
@@ -293,7 +296,7 @@ class CausalMultiHeadAttention(nn.Module):
     v = v.reshape(b, t, self.n_kv_head, self.head_sz)   # -> (B, T, n_kv_head, head_sz), We are not going to transpose now to make VE work, then we transpose
     # Add the Gate,ve to V
     if self.ve_flag:
-        gate = 3 * torch.sigmoid(self.ve_gate(x[:,:,:self.n_embd_gate])) # -> (B,T,C[:n]) -> (B,T,n_kv_head)
+        gate = 3 * torch.sigmoid(self.ve_gate(x[:,:,:self.n_embd_ve_gate])) # -> (B,T,C[:n]) -> (B,T,n_kv_head)
         if x_ve_input is not None:  ve = self.ve(x_ve_input).view(b, t, self.n_kv_head, self.head_sz) # (B,T, head_sz * n_kv_head) -> (B,T, n_kv_head, head_sz)
         else: raise ValueError("Missing required inputs: You must provide either 'x_ve' or 'x_ve_indicies' For ValueEmbeddings to Work")
         v = v + gate.unsqueeze(-1) * ve   # unsqueeze -> ( B, T, n_kv_head, 1)
@@ -361,6 +364,11 @@ class GPT(nn.Module):
     self.x0_lambdas =  nn.Parameter(torch.zeros(config.n_layer, config.num_per_layer_scalars))
     assert config.n_embd % config.num_per_layer_scalars == 0, f"num_per_layer_scalars: {config.num_per_layer_scalars}  Must be <=  n_emb: {config.n_embd}  && n_emb: {config.n_embd} should be divisible by num_per_layer_scalars: {config.num_per_layer_scalars}"
     self.repetition = config.n_embd // config.num_per_layer_scalars
+    # Smear_Gate & Assert
+    if config.smear_gate_flag:
+        assert config.n_embd_smear_gate <= config.n_embd, f'Number of Embeddings in Smear_Gate: {config.n_embd_smear_gate}  should be <= Number of Embeddings: {config.n_embd}'
+        self.smear_gate = nn.Linear(config.n_embd_smear_gate, 1) # That is for like Based on who I'm Now, How much do I depend on the token Before me
+        self.smear_lambda = nn.Parameter(torch.zeros(1)) # Scaling Factor
     # Make the Transformer
     transformer_modules = {
         'wte': nn.Embedding(config.vocab_size, config.n_embd),
@@ -369,7 +377,7 @@ class GPT(nn.Module):
     }
     # add ve_TableEmbedding if True
     if not config.Table_embds_per_layer:
-        transformer_modules['ve_te'] = nn.Embedding(config.vocab_size, config.n_embd_gate)
+        transformer_modules['ve_te'] = nn.Embedding(config.vocab_size, config.n_embd_ve_gate)
     # make the module
     self.transformer = nn.ModuleDict(transformer_modules)
     # Make the head
@@ -399,6 +407,11 @@ class GPT(nn.Module):
     x_ve_input = self.transformer.ve_te(x) if 've_te' in self.transformer else x
     # Tokens -> Embeddings
     x =  self.transformer.wte(x) # x -> (B, tokens, embs)
+    # Smear Gate
+    if self.config.smear_gate_flag:
+        gate = torch.sigmoid(self.smear_gate(x[:,:-1,:self.config.n_embd_smear_gate]))
+        prev = F.pad(self.smear_lambda * gate * x[:,:-1], (0,0,1,0)) # can't do x[:,1:] += ... directly — in-place ops corrupt autograd's tape, backward would read mutated values instead of originals → wrong gradients
+        x = x + prev
     # Pass Input in Transformer Layers
     x0 = x.clone() # Save x0
     for i, (layer, char) in enumerate(zip(self.transformer.h, self.att_mask_patt)):
