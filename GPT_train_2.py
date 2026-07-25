@@ -104,6 +104,11 @@ class GPT_config:
     ### SmearGate
     smear_gate_flag: bool = True
     n_embd_smear_gate: int = 24
+    ### Backout (Removing the Intermediate or Middle of output of Transformer from the final layer)
+    backout_flag: bool = True
+    backout_layer: Optional[int] = None  # the default if it was none -> n_layer//2     - NOTE: first_layer_idx = 1
+    ### Logit Softcap
+    logit_softcap: int = 15
 
 ##_____________________________________ OPTIMIZER __________________________________
 
@@ -369,6 +374,11 @@ class GPT(nn.Module):
         assert config.n_embd_smear_gate <= config.n_embd, f'Number of Embeddings in Smear_Gate: {config.n_embd_smear_gate}  should be <= Number of Embeddings: {config.n_embd}'
         self.smear_gate = nn.Linear(config.n_embd_smear_gate, 1) # That is for like Based on who I'm Now, How much do I depend on the token Before me
         self.smear_lambda = nn.Parameter(torch.zeros(1)) # Scaling Factor
+    # backout
+    if config.backout_flag :
+        self.backout_lambda = nn.Parameter(torch.zeros(1))
+        self.backout_layer = config.n_layer//2 if config.backout_layer is None else config.backout_layer
+        assert 0 < self.backout_layer < config.n_layer, f"backout_layer: {self.backout_layer} must be between 1 and n_layer: {config.n_layer}"
     # Make the Transformer
     transformer_modules = {
         'wte': nn.Embedding(config.vocab_size, config.n_embd),
@@ -419,10 +429,15 @@ class GPT(nn.Module):
         x0_lambdas = self.x0_lambdas[i].repeat(self.repetition)
         x = resid_lambdas * x + x0_lambdas * x0
         x = layer(x, char, x_ve_input)
+        if self.config.backout_flag:
+            if i == (self.backout_layer - 1) : x_backout =  x.clone()
+    if self.config.backout_flag: x = x - self.backout_lambda * x_backout
     # Apply LayerNorm
     x = self.transformer.ln_f(x)
     # lm_head -> Get Logits
     logits = self.lm_head(x)
+    # Apply logits softcap
+    logits = self.config.logit_softcap * torch.tanh(logits/self.config.logit_softcap)
     # Return Loss, Logits
     loss = None
     if targets is not None:  loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1))
