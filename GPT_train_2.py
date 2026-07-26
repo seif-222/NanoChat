@@ -16,7 +16,11 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from functools import partial
+
+from transformers.models.gemma import configuration_gemma
+
 from HellaSwag import render_example, iterate_examples
+
 
 ###_________________________ DISTRIBUTED TRAINING _______________________________________
 
@@ -43,25 +47,30 @@ else:
 
 @dataclass
 class GPT_config:
-    ### for model
+    """All hyperparameters and flags for the model, data, optimizer and training."""
+
+    # model
     n_embd: int = 1024
     n_head: int = 8
     n_layer: int = 8
     vocab_size: int = 50304
-    block_size: int = 512  # Just a number that is divisible by 2 more times that the standard 50257
-    mpl_expantion_term: int = 4  # That is at the MLP linear layers   layer1 : (n_embd -> mpl_expantion_term * n_embd), ....
-    ### for data
-    bs: int = 16                          # per-GPU micro batch
+    block_size: int = 512                       # Just a number that is divisible by 2 more times that the standard 50257
+    mpl_expantion_term: int = 4                 # That is at the MLP linear layers   layer1 : (n_embd -> mpl_expantion_term * n_embd), ....
+
+    # data
+    bs: int = 16                                # per-GPU micro batch
     tokenizer: str = 'gpt2'
     tot_bs_for_grad_accum: int = 131072
     # for the training shards
     data_root: str = "/kaggle/input/datasets/seif222/gpt-train-kaggle-zero-to-hero"   # <- point at your actual shards
-    ### for optim sched
+
+    # optim sched
     max_lr: float = 6e-4
     min_lr_ratio: float = 0.1
     warmup_steps: int = 10
     max_steps: int = 900
-    ### for optim
+
+    # optim
     beta1: float = 0.9
     beta2: float = 0.95
     eps: float = 1e-8
@@ -70,18 +79,23 @@ class GPT_config:
     red_dim: int = -1
     steps: int = 5
     Nesterov: bool = True
-    ### for training & Validation
-    training_steps: int = 1000                 # = max_steps
+
+    # training & Validation
+    training_steps: int = 1000                   # = max_steps
     val_after_step: int = 100
     val_loss_accum_steps: int = 5
-    ### CheckPoint
+
+    # CheckPoint
     checkpoint_after_steps: int = 50
-    ### device
+
+    # device
     device: str = device
-    ### Multi-Device Training
+
+    # Multi-Device Training
     process_rank: int = ddp_rank
     num_processes: int = ddp_world_size
-    ### Options
+
+    # Options
     # validaiton
     validation: bool = True
     # sampling
@@ -89,35 +103,47 @@ class GPT_config:
     num_sequence: int = 3
     max_length: int = 40
     #compile
-    use_compile: bool = False                # note: compile breaks HellaSwag/gen
-    ### RoPE
+    use_compile: bool = False                    # note: compile breaks HellaSwag/gen
+
+    # RoPE
     base: int = 10000
-    ## For GQA
+
+    # For GQA
     n_kv_head: int = 2
-    ### Sliding window
+
+    # Sliding window
     mask_pattern: str = 'SSL'
     window_size: int = 32
-    ### Value Residual Injection
-    n_embd_ve_gate:int = 24
+
+    # Value Residual Injection
+    n_embd_ve_gate: int = 24
     Table_embds_per_layer: bool = True
-    ve_per_n_layers: int = 2    # how much do we want to apply it  (per n layers)
-    ### per layer scalars
-    num_per_layer_scalars: int = 1  # 1 is the default
-    ### SmearGate
+    ve_per_n_layers: int = 2                     # how much do we want to apply it  (per n layers)
+
+    # per layer scalars
+    num_per_layer_scalars: int = 1               # 1 is the default
+
+    # SmearGate
     smear_gate_flag: bool = True
     n_embd_smear_gate: int = 24
-    ### Backout (Removing the Intermediate or Middle of output of Transformer from the final layer)
+
+    # Backout                                   -> Removing the Intermediate or Middle of output of Transformer from the final layer
     backout_flag: bool = True
-    backout_layer: Optional[int] = None  # the default if it was none -> n_layer//2     - NOTE: first_layer_idx = 1
-    ### Logit Softcap
+    backout_layer: Optional[int] = None         # the default if it was none -> n_layer//2     - NOTE: first_layer_idx = 1
+
+    # Logit Softcap
     logit_softcap: int = 15
-    ### Blending the EmbeddingTable weights with FinalLinearLayer weights
+
+    # Blending the EmbeddingTable weights with FinalLinearLayer weights
     blend_lm_head_wte_weights: bool = True
 
-##_____________________________________ OPTIMIZER __________________________________
+
+###_________________________ OPTIMIZER _______________________________________
 
 class MuonAdamW:
-    def __init__(self, params, lr, beta2, red_dim, steps=5 , beta1=0.9, Nesterov=True, eps=1e-7):
+    """Hybrid optimizer: Muon (Newton-Schulz) for matrices + AdamW-style for the rest."""
+
+    def __init__(self, params, lr, beta2, red_dim, steps=5, beta1=0.9, Nesterov=True, eps=1e-7):
         self.params = params
         self.lr = lr
         self.beta2 = beta2
@@ -138,40 +164,40 @@ class MuonAdamW:
         self.i += 1
 
     def zero_grad(self):
-        for g in self.params :
-            for p in g['params'] :
-                if p.grad is not None : p.grad.data.zero_()
+        for g in self.params:
+            for p in g['params']:
+                if p.grad is not None: p.grad.data.zero_()
 
     def opt_step(self, p, wd, lr, use_muon=None):
         if use_muon is None:
             use_muon = (p.dim() >= 2)   # fallback for old-style groups
 
         if not use_muon:
-            if not hasattr(p,'grad_avg'): p.grad_avg = torch.zeros_like(p.grad.data)
+            if not hasattr(p, 'grad_avg'): p.grad_avg = torch.zeros_like(p.grad.data)
             if not hasattr(p, 'grad_sqr_avg'): p.grad_sqr_avg = torch.zeros_like(p.grad.data)
             p.grad_avg.lerp_(p.grad, 1 - self.beta1)
             p.grad_sqr_avg.lerp_(p.grad.square(), 1 - self.beta2)
-            unbiased_grad_avg = p.grad_avg / (1 - self.beta1 ** (self.i+1) )
-            unbiased_grad_sqr_avg = p.grad_sqr_avg / (1 - self.beta2 ** (self.i+1) )
+            unbiased_grad_avg = p.grad_avg / (1 - self.beta1 ** (self.i+1))
+            unbiased_grad_sqr_avg = p.grad_sqr_avg / (1 - self.beta2 ** (self.i+1))
             update = unbiased_grad_avg / (unbiased_grad_sqr_avg.sqrt() + self.eps)
-            if wd : update += wd * p.data
+            if wd: update += wd * p.data
             p.data.sub_(lr * update)
         else:
             g = p.grad.data
 
             # Nesterov momentum
-            if not hasattr(p,'grad_avg'): p.grad_avg = torch.zeros_like(g)
+            if not hasattr(p, 'grad_avg'): p.grad_avg = torch.zeros_like(g)
             p.grad_avg.lerp_(g, 1 - self.beta1)
-            unbiased_grad_avg = p.grad_avg  / (1 - self.beta1 ** (self.i+1) )
+            unbiased_grad_avg = p.grad_avg / (1 - self.beta1 ** (self.i+1))
             g = g.lerp(unbiased_grad_avg, self.beta1) if self.Nesterov else unbiased_grad_avg
 
             # Normalization using Norm
-            target = g.norm(dim=(-1,-2), keepdim=True) * (g.size(-2)**-0.5)
+            target = g.norm(dim=(-1, -2), keepdim=True) * (g.size(-2)**-0.5)
             row_norm = g.norm(dim=(-1), keepdim=True)
-            g = g * (target / (row_norm+self.eps))
+            g = g * (target / (row_norm + self.eps))
 
             # Frobenius norm
-            g /= (g.norm(dim=(-1,-2), keepdim=True) * 1.01 + self.eps)  # 1.01 is just safety so that everything is <1 and <-1 and not =
+            g /= (g.norm(dim=(-1, -2), keepdim=True) * 1.01 + self.eps)  # 1.01 is just safety so that everything is <1 and <-1 and not =
 
             # Newton sched
             a, b, c = 3.4445, -4.7750, 2.0315
@@ -181,36 +207,37 @@ class MuonAdamW:
                 g = a * g + B @ g
 
             # Muon+ normalization
-            targ_norm = min(g.size(-2), g.size(-1))  ** 0.5
-            current_norm = g.norm(dim=(-1,-2), keepdim=True)
-            g = g * (targ_norm / (current_norm+self.eps))
+            targ_norm = min(g.size(-2), g.size(-1))**0.5
+            current_norm = g.norm(dim=(-1, -2), keepdim=True)
+            g = g * (targ_norm / (current_norm + self.eps))
 
             # Variance Reduction
             v_mean = g.square().mean(dim=self.red_dim, keepdim=True)
             red_dim_sz = g.size(self.red_dim)
-            v_norm_sq = v_mean.sum(dim=(-1,-2), keepdim=True) * red_dim_sz
+            v_norm_sq = v_mean.sum(dim=(-1, -2), keepdim=True) * red_dim_sz
             v_norm = v_norm_sq.sqrt()
             if not hasattr(p, 'v_mean_avg'): p.v_mean_avg = torch.zeros_like(v_mean)
             p.v_mean_avg.lerp_(v_mean, 1 - self.beta2)
-            unbiased_v_mean_avg = p.v_mean_avg  / (1 - self.beta2 ** (self.i+1))
-            step_sz = (unbiased_v_mean_avg+self.eps).rsqrt()
+            unbiased_v_mean_avg = p.v_mean_avg / (1 - self.beta2 ** (self.i+1))
+            step_sz = (unbiased_v_mean_avg + self.eps).rsqrt()
             scaled_sq_sum = (v_mean * red_dim_sz) * step_sz.square()
-            v_norm_new = scaled_sq_sum.sum(dim=(-1,-2), keepdim=True).sqrt()
+            v_norm_new = scaled_sq_sum.sum(dim=(-1, -2), keepdim=True).sqrt()
             final_scale = step_sz * (v_norm / v_norm_new)
             g = g * final_scale
 
             # Update
             mask = (g * unbiased_grad_avg) >= 0
             update = g + wd * p.data * mask if wd else g
-            p.data.sub_(lr * update) # Make it in place
+            p.data.sub_(lr * update)  # Make it in place
 
 
 ###________________________ CREATING THE RoPE POSITIONAL ENCODING ______________________
 
 class RoPE(nn.Module):
+    """Rotary Positional Embeddings (half-dimension rotation style)."""
+
     def __init__(self, config):
         super().__init__()
-        self.config = config
         inv_freq = self._create_inv_freq(config.n_embd // config.n_head, config.base)
         self.sequence_length = config.block_size
         self.register_buffer('angles', self._create_angles(inv_freq, self.sequence_length).unsqueeze(0))
@@ -218,17 +245,17 @@ class RoPE(nn.Module):
     def _create_inv_freq(self, head_dim, base=10000):
         dim = head_dim // 2
         x = torch.arange(dim, dtype=torch.float32)
-        inv_freq = base ** (- x / dim )
+        inv_freq = base ** (-x / dim)
         return inv_freq
 
     def _create_angles(self, inv_freq, sequence_length=100):
-        positions = torch.arange(sequence_length,device=inv_freq.device,dtype=torch.float32)
+        positions = torch.arange(sequence_length, device=inv_freq.device, dtype=torch.float32)
         angles = positions[:, None] * inv_freq[None, :]
         return angles
 
     def _rotation(self, x, angles):
-        x1 = x[...,:x.shape[-1]//2]
-        x2 = x[...,x.shape[-1]//2:]
+        x1 = x[..., :x.shape[-1]//2]
+        x2 = x[..., x.shape[-1]//2:]
 
         sin_angles = angles.sin()
         cos_angles = angles.cos()
@@ -249,234 +276,244 @@ class RoPE(nn.Module):
         return self._rotation(x, angles)
 
 
-####_________________________ NORMALIZATION FUNC & (VE_FLAG BASED ON IDX,ETC... FUNC )___________________________
+###_________________________ NORMALIZATION + VE FLAG HELPERS ___________________________
 
 def norm(x, eps=1e-6):
-    return F.rms_norm(x, (x.shape[-1],), weight=None,  eps=eps)  # RMS normalization with epsilon for numerical stability
+    """RMSNorm without learnable weight."""
+    return F.rms_norm(x, (x.shape[-1],), weight=None, eps=eps)  # RMS normalization with epsilon for numerical stability
+
 
 def compute_ve_flag(layer_idx, n_layers, ve_per_n_layers):
-    is_alternating =   layer_idx % ve_per_n_layers == (n_layers - 1) % ve_per_n_layers
+    """Decide whether this layer should receive Value Residual injection."""
+    is_alternating = layer_idx % ve_per_n_layers == (n_layers - 1) % ve_per_n_layers
     return is_alternating or layer_idx == (n_layers - 1)  # is alternating or the last layer
 
 
 ###_________________________ CREATING THE MODEL _______________________________________
 
 class CausalMultiHeadAttention(nn.Module):
-  def __init__(self, config, idx):
-    super().__init__()
-    # Save attr
-    self.rope = RoPE(config)
-    self.n_head = config.n_head
-    self.n_embd = config.n_embd
-    self.n_kv_head = config.n_kv_head
-    self.window_size = config.window_size
-    self.n_embd_ve_gate =  config.n_embd_ve_gate
-    self.ATTN_IDX = idx
-    self.ve_flag = False
-    # assert errors
-    assert self.n_head % self.n_kv_head == 0, f"n_head: {self.n_head}, n_kv_head: {self.n_kv_head} Aren't Divisible"
-    assert self.n_embd % self.n_head == 0, f"Number of Embeddings: {self.n_embd},  must be a multiple of n_head: {self.n_head}"
-    assert self.window_size <= config.block_size , f'Window size: {self.window_size} should be <= block_size: {config.block_size}'
-    assert config.ve_per_n_layers <= config.n_layer, f"ve_per_n_layers: {config.ve_per_n_layers} can't be > {config.n_layer}"
-    if not config.Table_embds_per_layer : assert self.n_embd_ve_gate <= self.n_embd, f'Number of Embeddings in ve_Gate Residual: {self.n_embd_ve_gate}  should be <= Number of Embeddings: {self.n_embd}'
-    # Group and Head size
-    self.head_sz = self.n_embd // self.n_head
-    self.group_sz = self.n_head // self.n_kv_head
-    # qkv
-    self.q_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-    self.kv_proj = nn.Linear(self.n_embd, 2 * self.head_sz * self.n_kv_head, bias=False)
-    # Projection
-    self.c_proj = nn.Linear(self.n_embd,self.n_embd, bias=False)
-    self.c_proj.INIT_SPECIAL_STD = 1
-    # Gate Linear & Embedding Table (if True) -> For the Value Embeddings / depending on n chosen for the frequency of ve
-    if compute_ve_flag(self.ATTN_IDX, config.n_layer, config.ve_per_n_layers):
-        self.ve_flag = True
-        if not config.Table_embds_per_layer : self.ve = nn.Linear(self.n_embd_ve_gate, self.head_sz * self.n_kv_head, bias=False)
-        if config.Table_embds_per_layer : self.ve = nn.Embedding(config.vocab_size, self.head_sz * self.n_kv_head)
-        self.ve_gate = nn.Linear(self.n_embd_ve_gate, self.n_kv_head, bias=False)
+    """Causal multi-head attention with GQA, optional sliding window, RoPE and Value Residual."""
 
-  def forward(self, x, char, x_ve_input): # x -> (B, T, E) | x_ve_input -> (token_indicies: in case of there is a ve_embd_table_per_layer),
-    # shapes                                                            -> (ve_embeddings: in case of there is a Global ve_embd_table)
-    b,t,c = x.shape
-    # get qkv
-    q = self.q_proj(x)
-    kv = self.kv_proj(x)
-    k, v = torch.chunk(kv, 2, dim=-1)
-    # Make them 4D shaped
-    q = q.reshape(b, t, self.n_head,    self.head_sz).transpose(1, 2)  # -> (B, n_head, T, head_sz)
-    k = k.reshape(b, t, self.n_kv_head, self.head_sz).transpose(1, 2)  # -> (B, n_kv_head, T, head_sz)
-    v = v.reshape(b, t, self.n_kv_head, self.head_sz)   # -> (B, T, n_kv_head, head_sz), We are not going to transpose now to make VE work, then we transpose
-    # Add the Gate,ve to V
-    if self.ve_flag:
-        gate = 3 * torch.sigmoid(self.ve_gate(x[:,:,:self.n_embd_ve_gate])) # -> (B,T,C[:n]) -> (B,T,n_kv_head)
-        if x_ve_input is not None:  ve = self.ve(x_ve_input).view(b, t, self.n_kv_head, self.head_sz) # (B,T, head_sz * n_kv_head) -> (B,T, n_kv_head, head_sz)
-        else: raise ValueError("Missing required inputs: You must provide either 'x_ve' or 'x_ve_indicies' For ValueEmbeddings to Work")
-        v = v + gate.unsqueeze(-1) * ve   # unsqueeze -> ( B, T, n_kv_head, 1)
-    # Transpose V
-    v = v.transpose(1, 2) # -> (B, n_kv_head, T, head_sz)
-    # apply RoPE
-    q,k = self.rope(q), self.rope(k)
-    # Normalization & Rescaling
-    q,k = norm(q), norm(k)
-    q,k = q * 1.2 , k * 1.2
-    # Run FlashAttention (IF char == L)
-    if char == 'L':
-        wei = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True) # enable_gqa=True -> is more efficient that reshaping and expanding ourselves
-        wei = wei.transpose(1, 2).reshape(b, t, c)                    # Combine the heads back
+    def __init__(self, config, idx):
+        super().__init__()
+        # Save attr
+        self.rope = RoPE(config)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.n_kv_head = config.n_kv_head
+        self.window_size = config.window_size
+        self.n_embd_ve_gate = config.n_embd_ve_gate
+        self.ATTN_IDX = idx
+        self.ve_flag = False
+        # assert errors
+        assert self.n_head % self.n_kv_head == 0, f"n_head: {self.n_head}, n_kv_head: {self.n_kv_head} Aren't Divisible"
+        assert self.n_embd % self.n_head == 0, f"Number of Embeddings: {self.n_embd},  must be a multiple of n_head: {self.n_head}"
+        assert self.window_size <= config.block_size, f'Window size: {self.window_size} should be <= block_size: {config.block_size}'
+        assert config.ve_per_n_layers <= config.n_layer, f"ve_per_n_layers: {config.ve_per_n_layers} can't be > {config.n_layer}"
+        if not config.Table_embds_per_layer: assert self.n_embd_ve_gate <= self.n_embd, f'Number of Embeddings in ve_Gate Residual: {self.n_embd_ve_gate}  should be <= Number of Embeddings: {self.n_embd}'
+        # Group and Head size
+        self.head_sz = self.n_embd // self.n_head
+        self.group_sz = self.n_head // self.n_kv_head
+        # qkv
+        self.q_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.kv_proj = nn.Linear(self.n_embd, 2 * self.head_sz * self.n_kv_head, bias=False)
+        # Projection
+        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_proj.INIT_SPECIAL_STD = 1
+        # Gate Linear & Embedding Table (if True) -> For the Value Embeddings / depending on n chosen for the frequency of ve
+        if compute_ve_flag(self.ATTN_IDX, config.n_layer, config.ve_per_n_layers):
+            self.ve_flag = True
+            if not config.Table_embds_per_layer: self.ve = nn.Linear(self.n_embd_ve_gate, self.head_sz * self.n_kv_head, bias=False)
+            if config.Table_embds_per_layer: self.ve = nn.Embedding(config.vocab_size, self.head_sz * self.n_kv_head)
+            self.ve_gate = nn.Linear(self.n_embd_ve_gate, self.n_kv_head, bias=False)
 
-    # Run FlashAttention (IF char == S)
-    if char == 'S' :
-        q,k,v = q.transpose(1,2), k.transpose(1,2), v.transpose(1,2)  # Because the flash_attn_func expects -> (B, T, n_head, head_sz) not (B, n_head, T, head_sz)
-        wei = flash_attn_func(q, k, v, causal=True, window_size=(self.window_size,0)) #  (left=window, right=0) -> only look back window tokens, never forward | causal=True is already what blocks future tokens but Both together are redundant but harmless.
-        wei = wei.reshape(b, t, c)                                    # Combine the heads back
+    def forward(self, x, char, x_ve_input):  # x -> (B, T, E)     | x_ve_input -> (token_indicies: in case of there is a ve_embd_table_per_layer),
+        # shapes                                                               -> (ve_embeddings: in case of there is a Global ve_embd_table)
+        b, t, c = x.shape
+        # get qkv
+        q = self.q_proj(x)
+        kv = self.kv_proj(x)
+        k, v = torch.chunk(kv, 2, dim=-1)
+        # Make them 4D shaped
+        q = q.reshape(b, t, self.n_head, self.head_sz).transpose(1, 2)                      # -> (B, n_head, T, head_sz)
+        k = k.reshape(b, t, self.n_kv_head, self.head_sz).transpose(1, 2)                   # -> (B, n_kv_head, T, head_sz)
+        v = v.reshape(b, t, self.n_kv_head, self.head_sz)                                   # -> (B, T, n_kv_head, head_sz), We are not going to transpose now to make VE work, then we transpose
+        # Add the Gate,ve to V
+        if self.ve_flag:
+            gate = 3 * torch.sigmoid(self.ve_gate(x[:, :, :self.n_embd_ve_gate]))                         # -> (B,T,C[:n]) -> (B,T,n_kv_head)
+            if x_ve_input is not None: ve = self.ve(x_ve_input).view(b, t, self.n_kv_head, self.head_sz)  # (B,T, head_sz * n_kv_head) -> (B,T, n_kv_head, head_sz)
+            else: raise ValueError("Missing required inputs: You must provide either 'x_ve' or 'x_ve_indicies' For ValueEmbeddings to Work")
+            v = v + gate.unsqueeze(-1) * ve   # unsqueeze -> ( B, T, n_kv_head, 1)
+        # Transpose V
+        v = v.transpose(1, 2)                 # -> (B, n_kv_head, T, head_sz)
+        # apply RoPE
+        q, k = self.rope(q), self.rope(k)
+        # Normalization & Rescaling
+        q, k = norm(q), norm(k)
+        q, k = q * 1.2, k * 1.2
+        # Run FlashAttention (IF char == L)
+        if char == 'L':
+            wei = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)  # enable_gqa=True -> is more efficient that reshaping and expanding ourselves
+            wei = wei.transpose(1, 2).reshape(b, t, c)                                      # Combine the heads back
 
-    # return the projection
-    return self.c_proj(wei)
+        # Run FlashAttention (IF char == S)
+        if char == 'S':
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)               # Because the flash_attn_func expects -> (B, T, n_head, head_sz) not (B, n_head, T, head_sz)
+            wei = flash_attn_func(q, k, v, causal=True, window_size=(self.window_size, 0))  # (left=window, right=0) -> only look back window tokens, never forward | causal=True is already what blocks future tokens but Both together are redundant but harmless.
+            wei = wei.reshape(b, t, c)                                                      # Combine the heads back
+
+        # return the projection
+        return self.c_proj(wei)
 
 
 class MLP(nn.Module):
-  def __init__(self, config):
-    super().__init__()
-    self.c_fc    = nn.Linear(config.n_embd, config.mpl_expantion_term * config.n_embd, bias=False)
-    self.c_proj  = nn.Linear(config.mpl_expantion_term * config.n_embd, config.n_embd, bias=False)
-    self.c_proj.INIT_SPECIAL_STD = 1
-  def forward(self, x):
-    return self.c_proj(F.relu(self.c_fc(x)).square())   # Made the Avtivation as the ReLU^2
+    """Simple MLP with ReLU² activation."""
 
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc = nn.Linear(config.n_embd, config.mpl_expantion_term * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(config.mpl_expantion_term * config.n_embd, config.n_embd, bias=False)
+        self.c_proj.INIT_SPECIAL_STD = 1
+
+    def forward(self, x):
+        return self.c_proj(F.relu(self.c_fc(x)).square())   # Made the Activation as the ReLU^2
 
 
 class Block(nn.Module):
-  def __init__(self, config, idx):
-    super().__init__()
-    self.attn = CausalMultiHeadAttention(config, idx)
-    self.mlp = MLP(config)
-  def forward(self, x, char, x_ve_input=None):
-    x = x + self.attn(norm(x), char, x_ve_input)
-    return x + self.mlp(norm(x))
+    """Transformer block = Attention + MLP (both with pre-norm)."""
+
+    def __init__(self, config, idx):
+        super().__init__()
+        self.attn = CausalMultiHeadAttention(config, idx)
+        self.mlp = MLP(config)
+
+    def forward(self, x, char, x_ve_input=None):
+        x = x + self.attn(norm(x), char, x_ve_input)
+        return x + self.mlp(norm(x))
 
 
 class GPT(nn.Module):
-  def __init__(self, config):
-    super().__init__()
-    # save attr
-    self.config = config
-    # Expand the attention masking pattern & assert & Make mask UpperCase
-    config.mask_pattern = config.mask_pattern.upper()
-    assert config.n_layer >= len(config.mask_pattern), f'n_layer:{config.n_layer}  must be >= len(mask_pattern):{len(config.mask_pattern)}'
-    assert all(c in 'SL' for c in config.mask_pattern), f'All chars in mask pattern: {config.mask_pattern} should be -> S or L'
-    self.att_mask_patt = (config.n_layer * config.mask_pattern)[:config.n_layer - 1] + 'L'
-    # Per_Layer_Scalars -> assert & repetition_attr, etc...
-    self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer, config.num_per_layer_scalars))
-    self.x0_lambdas =  nn.Parameter(torch.zeros(config.n_layer, config.num_per_layer_scalars))
-    assert config.n_embd % config.num_per_layer_scalars == 0, f"num_per_layer_scalars: {config.num_per_layer_scalars}  Must be <=  n_emb: {config.n_embd}  && n_emb: {config.n_embd} should be divisible by num_per_layer_scalars: {config.num_per_layer_scalars}"
-    self.repetition = config.n_embd // config.num_per_layer_scalars
-    # Smear_Gate & Assert
-    if config.smear_gate_flag:
-        assert config.n_embd_smear_gate <= config.n_embd, f'Number of Embeddings in Smear_Gate: {config.n_embd_smear_gate}  should be <= Number of Embeddings: {config.n_embd}'
-        self.smear_gate = nn.Linear(config.n_embd_smear_gate, 1, bias=False) # That is for like Based on who I'm Now, How much do I depend on the token Before me
-        self.smear_lambda = nn.Parameter(torch.zeros(1)) # Scaling Factor
-    # backout
-    if config.backout_flag :
-        self.backout_lambda = nn.Parameter(torch.zeros(1))
-        self.backout_layer = config.n_layer//2 if config.backout_layer is None else config.backout_layer
-        assert 0 < self.backout_layer < config.n_layer, f"backout_layer: {self.backout_layer} must be between 1 and n_layer: {config.n_layer}"
-    # Make the Transformer
-    transformer_modules = {
-        'wte': nn.Embedding(config.vocab_size, config.n_embd),
-        'h': nn.ModuleList([Block(config, idx) for idx in range(config.n_layer)]),
-    }
-    # add ve_TableEmbedding if True
-    if not config.Table_embds_per_layer:
-        transformer_modules['ve_te'] = nn.Embedding(config.vocab_size, config.n_embd_ve_gate)
-    # make the module
-    self.transformer = nn.ModuleDict(transformer_modules)
-    # Make the head
-    self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-    # Make the last Linear later the same as the embedding layer
-    if config.blend_lm_head_wte_weights: self.lm_head.weight = self.transformer.wte.weight
-    # Apply Initialization
-    self.apply(self._initalization)
+    """Main GPT model with optional SmearGate, Backout, Value Residual, GQA, etc."""
 
+    def __init__(self, config):
+        super().__init__()
+        # save attr
+        self.config = config
+        # Expand the attention masking pattern & assert & Make mask UpperCase
+        config.mask_pattern = config.mask_pattern.upper()
+        assert config.n_layer >= len(config.mask_pattern), f'n_layer:{config.n_layer}  must be >= len(mask_pattern):{len(config.mask_pattern)}'
+        assert all(c in 'SL' for c in config.mask_pattern), f'All chars in mask pattern: {config.mask_pattern} should be -> S or L'
+        self.att_mask_patt = (config.n_layer * config.mask_pattern)[:config.n_layer - 1] + 'L'
+        # Per_Layer_Scalars -> assert & repetition_attr, etc...
+        self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer, config.num_per_layer_scalars))
+        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer, config.num_per_layer_scalars))
+        assert config.n_embd % config.num_per_layer_scalars == 0, f"num_per_layer_scalars: {config.num_per_layer_scalars}  Must be <=  n_emb: {config.n_embd}  && n_emb: {config.n_embd} should be divisible by num_per_layer_scalars: {config.num_per_layer_scalars}"
+        self.repetition = config.n_embd // config.num_per_layer_scalars
+        # Smear_Gate & Assert
+        if config.smear_gate_flag:
+            assert config.n_embd_smear_gate <= config.n_embd, f'Number of Embeddings in Smear_Gate: {config.n_embd_smear_gate}  should be <= Number of Embeddings: {config.n_embd}'
+            self.smear_gate = nn.Linear(config.n_embd_smear_gate, 1, bias=False)  # That is for like Based on who I'm Now, How much do I depend on the token Before me
+            self.smear_lambda = nn.Parameter(torch.zeros(1))                      # Scaling Factor
+        # backout
+        if config.backout_flag:
+            self.backout_lambda = nn.Parameter(torch.zeros(1))
+            self.backout_layer = config.n_layer // 2 if config.backout_layer is None else config.backout_layer
+            assert 0 < self.backout_layer < config.n_layer, f"backout_layer: {self.backout_layer} must be between 1 and n_layer: {config.n_layer}"
+        # Make the Transformer
+        transformer_modules = {
+            'wte': nn.Embedding(config.vocab_size, config.n_embd),
+            'h': nn.ModuleList([Block(config, idx) for idx in range(config.n_layer)]),
+        }
+        # add ve_TableEmbedding if True
+        if not config.Table_embds_per_layer:
+            transformer_modules['ve_te'] = nn.Embedding(config.vocab_size, config.n_embd_ve_gate)
+        # make the module
+        self.transformer = nn.ModuleDict(transformer_modules)
+        # Make the head
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # Make the last Linear later the same as the embedding layer
+        if config.blend_lm_head_wte_weights: self.lm_head.weight = self.transformer.wte.weight
+        # Apply Initialization
+        self.apply(self._initalization)
 
-  ## Make Initialization function
-  def _initalization(self, module):
-      if isinstance(module, nn.Linear):
-          std = 0.02
-          if hasattr(module, 'INIT_SPECIAL_STD'):  std *= (2 * self.config.n_layer) ** -0.5
-          nn.init.normal_(module.weight,mean=0., std=std) # torch.nn
-          if module.bias is not None:  nn.init.zeros_(module.bias)
-      elif isinstance(module, nn.Embedding):
-          nn.init.normal_(module.weight, mean=0., std=0.02)
+    def _initalization(self, module):
+        """Custom weight initialization (special std for residual projections)."""
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'INIT_SPECIAL_STD'): std *= (2 * self.config.n_layer) ** -0.5
+            nn.init.normal_(module.weight, mean=0., std=std)  # torch.nn
+            if module.bias is not None: nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0., std=0.02)
 
+    def forward(self, x, targets=None):  # x -> (B, Tokens)
+        # Shape & Assert
+        B, T = x.shape
+        assert T <= self.config.block_size, f'The Context Exceeds the block size {T} > {self.config.block_size}'
+        # get the VE_input
+        x_ve_input = self.transformer.ve_te(x) if 've_te' in self.transformer else x
+        # Tokens -> Embeddings
+        x = self.transformer.wte(x)  # x -> (B, tokens, embs)
+        x = norm(x)
+        # Smear Gate
+        if self.config.smear_gate_flag:
+            gate = torch.sigmoid(self.smear_gate(x[:, 1:, :self.config.n_embd_smear_gate]))
+            prev = F.pad(self.smear_lambda * gate * x[:, :-1], (0, 0, 1, 0))  # can't do x[:,1:] += ... directly — in-place ops corrupt autograd's tape, backward would read mutated values instead of originals → wrong gradients
+            x = x + prev
+        # Pass Input in Transformer Layers
+        x0 = x.clone()  # Save x0
+        for i, (layer, char) in enumerate(zip(self.transformer.h, self.att_mask_patt)):
+            resid_lambdas = self.resid_lambdas[i].repeat_interleave(self.repetition)
+            x0_lambdas = self.x0_lambdas[i].repeat_interleave(self.repetition)
+            x = resid_lambdas * x + x0_lambdas * x0
+            x = layer(x, char, x_ve_input)
+            if self.config.backout_flag:
+                if i == (self.backout_layer - 1): x_backout = x.clone()
+        if self.config.backout_flag: x = x - self.backout_lambda * x_backout
+        # Apply RMSNorm
+        x = norm(x)
+        # lm_head -> Get Logits
+        logits = self.lm_head(x)
+        # Apply logits softcap
+        logits = self.config.logit_softcap * torch.tanh(logits / self.config.logit_softcap)
+        logits = logits.float()
+        # Return Loss, Logits
+        loss = None
+        if targets is not None: loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1))
+        return logits, loss
 
-  def forward(self, x, targets=None): # x -> (B, Tokens)
-    # Shape & Assert
-    B, T = x.shape
-    assert T <= self.config.block_size, f'The Context Exceeds the block size {T} > {self.config.block_size}'
-    # get the VE_input
-    x_ve_input = self.transformer.ve_te(x) if 've_te' in self.transformer else x
-    # Tokens -> Embeddings
-    x =  self.transformer.wte(x) # x -> (B, tokens, embs)
-    x = norm(x)
-    # Smear Gate
-    if self.config.smear_gate_flag:
-        gate = torch.sigmoid(self.smear_gate(x[:,1:,:self.config.n_embd_smear_gate]))
-        prev = F.pad(self.smear_lambda * gate * x[:,:-1], (0,0,1,0)) # can't do x[:,1:] += ... directly — in-place ops corrupt autograd's tape, backward would read mutated values instead of originals → wrong gradients
-        x = x + prev
-    # Pass Input in Transformer Layers
-    x0 = x.clone() # Save x0
-    for i, (layer, char) in enumerate(zip(self.transformer.h, self.att_mask_patt)):
-        resid_lambdas = self.resid_lambdas[i].repeat_interleave(self.repetition)
-        x0_lambdas = self.x0_lambdas[i].repeat_interleave(self.repetition)
-        x = resid_lambdas * x + x0_lambdas * x0
-        x = layer(x, char, x_ve_input)
-        if self.config.backout_flag:
-            if i == (self.backout_layer - 1) : x_backout =  x.clone()
-    if self.config.backout_flag: x = x - self.backout_lambda * x_backout
-    # Apply RMSNorm
-    x = norm(x)
-    # lm_head -> Get Logits
-    logits = self.lm_head(x)
-    # Apply logits softcap
-    logits = self.config.logit_softcap * torch.tanh(logits/self.config.logit_softcap)
-    logits = logits.float()
-    # Return Loss, Logits
-    loss = None
-    if targets is not None:  loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1))
-    return logits, loss
+    def optimizers_config(self, device_type, optimizer=None):
+        """Build either plain AdamW or MuonAdamW param groups."""
+        params_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
 
+        # Embedding / unembedding must NOT go through Muon's Newton-Schulz step
+        no_muon_names = {'transformer.wte.weight', 'lm_head.weight'}
 
-  def optimizers_config(self, device_type, optimizer=None):
-    params_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
-
-    # Embedding / unembedding must NOT go through Muon's Newton-Schulz step
-    no_muon_names = {'transformer.wte.weight', 'lm_head.weight'}
-
-    if optimizer is None:
-        decay_params = [p for pn, p in params_dict.items() if p.dim() >= 2]
-        no_decay_params = [p for pn, p in params_dict.items() if p.dim() < 2]
-        optim_group = [
-            {'params': decay_params, 'weight_decay': self.config.weight_decay},
-            {'params': no_decay_params, 'weight_decay': 0.},
-        ]
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fuse = fused_available and device_type == 'cuda'
-        return torch.optim.AdamW(optim_group, lr=self.config.max_lr,
-                                  betas=(self.config.beta1, self.config.beta2),
-                                  eps=self.config.eps, fused=use_fuse)
-    else:
-        muon_params = [p for pn, p in params_dict.items()
-                        if p.dim() >= 2 and pn not in no_muon_names]
-        adam_params = [p for pn, p in params_dict.items()
-                        if p.dim() < 2 or pn in no_muon_names]
-        optim_group = [
-            {'params': muon_params, 'weight_decay': self.config.weight_decay, 'use_muon': True},
-            {'params': adam_params, 'weight_decay': 0.,                       'use_muon': False},
-        ]
-        return optimizer(optim_group, lr=self.config.max_lr, beta1=self.config.beta1,
-                          beta2=self.config.beta2, eps=self.config.eps,
-                          steps=self.config.steps, red_dim=self.config.red_dim,
-                          Nesterov=self.config.Nesterov)
+        if optimizer is None:
+            decay_params = [p for pn, p in params_dict.items() if p.dim() >= 2]
+            no_decay_params = [p for pn, p in params_dict.items() if p.dim() < 2]
+            optim_group = [
+                {'params': decay_params, 'weight_decay': self.config.weight_decay},
+                {'params': no_decay_params, 'weight_decay': 0.},
+            ]
+            fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+            use_fuse = fused_available and device_type == 'cuda'
+            return torch.optim.AdamW(optim_group, lr=self.config.max_lr,
+                                     betas=(self.config.beta1, self.config.beta2),
+                                     eps=self.config.eps, fused=use_fuse)
+        else:
+            muon_params = [p for pn, p in params_dict.items()
+                           if p.dim() >= 2 and pn not in no_muon_names]
+            adam_params = [p for pn, p in params_dict.items()
+                           if p.dim() < 2 or pn in no_muon_names]
+            optim_group = [
+                {'params': muon_params, 'weight_decay': self.config.weight_decay, 'use_muon': True},
+                {'params': adam_params, 'weight_decay': 0., 'use_muon': False},
+            ]
+            return optimizer(optim_group, lr=self.config.max_lr, beta1=self.config.beta1,
+                             beta2=self.config.beta2, eps=self.config.eps,
+                             steps=self.config.steps, red_dim=self.config.red_dim,
+                             Nesterov=self.config.Nesterov)
 
 ###______________________________________ MAKE A DATALOADER ________________________________
 
