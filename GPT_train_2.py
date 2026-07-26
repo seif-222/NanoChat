@@ -8,6 +8,7 @@ import numpy as np
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 from flash_attn import flash_attn_func
+from typing import Optional
 import torch.distributed as dist
 
 from dataclasses import dataclass
@@ -48,6 +49,7 @@ class GPT_config:
     n_layer: int = 8
     vocab_size: int = 50304
     block_size: int = 512  # Just a number that is divisible by 2 more times that the standard 50257
+    mpl_expantion_term: int = 4  # That is at the MLP linear layers   layer1 : (n_embd -> mpl_expantion_term * n_embd), ....
     ### for data
     bs: int = 16                          # per-GPU micro batch
     tokenizer: str = 'gpt2'
@@ -109,6 +111,8 @@ class GPT_config:
     backout_layer: Optional[int] = None  # the default if it was none -> n_layer//2     - NOTE: first_layer_idx = 1
     ### Logit Softcap
     logit_softcap: int = 15
+    ### Blending the EmbeddingTable weights with FinalLinearLayer weights
+    blend_lm_head_wte_weights: bool = True
 
 ##_____________________________________ OPTIMIZER __________________________________
 
@@ -207,6 +211,9 @@ class RoPE(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        inv_freq = self._create_inv_freq(config.n_embd // config.n_head, config.base)
+        self.sequence_length = config.block_size
+        self.register_buffer('angles', self._create_angles(inv_freq, self.sequence_length).unsqueeze(0))
 
     def _create_inv_freq(self, head_dim, base=10000):
         dim = head_dim // 2
@@ -234,11 +241,11 @@ class RoPE(nn.Module):
 
     def forward(self, x):
         # Get the dims & device
-        n_head_dim = x.shape[-1]
         seq_len = x.shape[-2]
+        assert seq_len <= self.sequence_length, f"Input Sequence Length for RoPE: {seq_len} should be <= The initialized Sequence Length: {self.sequence_length}"
         # create angles
-        angles = self._create_angles(self._create_inv_freq(n_head_dim, self.config.base).to(x.device),  seq_len)
-        angles = angles.unsqueeze(0)
+        angles = self.angles.to(device=x.device, dtype=x.dtype)
+        angles = angles[:, :seq_len]
         return self._rotation(x, angles)
 
 
@@ -276,17 +283,17 @@ class CausalMultiHeadAttention(nn.Module):
     self.head_sz = self.n_embd // self.n_head
     self.group_sz = self.n_head // self.n_kv_head
     # qkv
-    self.q_proj = nn.Linear(self.n_embd, self.n_embd)
-    self.kv_proj = nn.Linear(self.n_embd, 2 * self.head_sz * self.n_kv_head)
+    self.q_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+    self.kv_proj = nn.Linear(self.n_embd, 2 * self.head_sz * self.n_kv_head, bias=False)
     # Projection
-    self.c_proj = nn.Linear(self.n_embd,self.n_embd)
+    self.c_proj = nn.Linear(self.n_embd,self.n_embd, bias=False)
     self.c_proj.INIT_SPECIAL_STD = 1
     # Gate Linear & Embedding Table (if True) -> For the Value Embeddings / depending on n chosen for the frequency of ve
     if compute_ve_flag(self.ATTN_IDX, config.n_layer, config.ve_per_n_layers):
         self.ve_flag = True
-        if not config.Table_embds_per_layer : self.ve = nn.Linear(self.n_embd_ve_gate, self.head_sz * self.n_kv_head)
+        if not config.Table_embds_per_layer : self.ve = nn.Linear(self.n_embd_ve_gate, self.head_sz * self.n_kv_head, bias=False)
         if config.Table_embds_per_layer : self.ve = nn.Embedding(config.vocab_size, self.head_sz * self.n_kv_head)
-        self.ve_gate = nn.Linear(self.n_embd_ve_gate, self.n_kv_head)
+        self.ve_gate = nn.Linear(self.n_embd_ve_gate, self.n_kv_head, bias=False)
 
   def forward(self, x, char, x_ve_input): # x -> (B, T, E) | x_ve_input -> (token_indicies: in case of there is a ve_embd_table_per_layer),
     # shapes                                                            -> (ve_embeddings: in case of there is a Global ve_embd_table)
@@ -312,13 +319,9 @@ class CausalMultiHeadAttention(nn.Module):
     # Normalization & Rescaling
     q,k = norm(q), norm(k)
     q,k = q * 1.2 , k * 1.2
-    # Expanding the k,v to match the number of heads
-    k = k.unsqueeze(2).expand(-1, -1, self.group_sz, -1, -1).reshape(b, self.n_head, t, -1)   #  -> (B, n_head, T, head_sz)
-    v = v.unsqueeze(2).expand(-1, -1, self.group_sz, -1, -1).reshape(b, self.n_head, t, -1)
-
     # Run FlashAttention (IF char == L)
     if char == 'L':
-        wei = F.scaled_dot_product_attention(q, k, v, is_causal=True) # is_casual=True -> causal mask is the triangular mask we built manually with torch.tril + masked_fill.
+        wei = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True) # enable_gqa=True -> is more efficient that reshaping and expanding ourselves
         wei = wei.transpose(1, 2).reshape(b, t, c)                    # Combine the heads back
 
     # Run FlashAttention (IF char == S)
@@ -334,8 +337,8 @@ class CausalMultiHeadAttention(nn.Module):
 class MLP(nn.Module):
   def __init__(self, config):
     super().__init__()
-    self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
-    self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
+    self.c_fc    = nn.Linear(config.n_embd, config.mpl_expantion_term * config.n_embd, bias=False)
+    self.c_proj  = nn.Linear(config.mpl_expantion_term * config.n_embd, config.n_embd, bias=False)
     self.c_proj.INIT_SPECIAL_STD = 1
   def forward(self, x):
     return self.c_proj(F.relu(self.c_fc(x)).square())   # Made the Avtivation as the ReLU^2
@@ -347,11 +350,9 @@ class Block(nn.Module):
     super().__init__()
     self.attn = CausalMultiHeadAttention(config, idx)
     self.mlp = MLP(config)
-    self.ln_1 = nn.LayerNorm(config.n_embd)
-    self.ln_2 = nn.LayerNorm(config.n_embd)
   def forward(self, x, char, x_ve_input=None):
-    x = x + self.attn(self.ln_1(x), char, x_ve_input)
-    return x + self.mlp(self.ln_2(x))
+    x = x + self.attn(norm(x), char, x_ve_input)
+    return x + self.mlp(norm(x))
 
 
 class GPT(nn.Module):
@@ -372,7 +373,7 @@ class GPT(nn.Module):
     # Smear_Gate & Assert
     if config.smear_gate_flag:
         assert config.n_embd_smear_gate <= config.n_embd, f'Number of Embeddings in Smear_Gate: {config.n_embd_smear_gate}  should be <= Number of Embeddings: {config.n_embd}'
-        self.smear_gate = nn.Linear(config.n_embd_smear_gate, 1) # That is for like Based on who I'm Now, How much do I depend on the token Before me
+        self.smear_gate = nn.Linear(config.n_embd_smear_gate, 1, bias=False) # That is for like Based on who I'm Now, How much do I depend on the token Before me
         self.smear_lambda = nn.Parameter(torch.zeros(1)) # Scaling Factor
     # backout
     if config.backout_flag :
@@ -383,7 +384,6 @@ class GPT(nn.Module):
     transformer_modules = {
         'wte': nn.Embedding(config.vocab_size, config.n_embd),
         'h': nn.ModuleList([Block(config, idx) for idx in range(config.n_layer)]),
-        'ln_f': nn.LayerNorm(config.n_embd)
     }
     # add ve_TableEmbedding if True
     if not config.Table_embds_per_layer:
@@ -393,7 +393,7 @@ class GPT(nn.Module):
     # Make the head
     self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
     # Make the last Linear later the same as the embedding layer
-    self.lm_head.weight = self.transformer.wte.weight
+    if config.blend_lm_head_wte_weights: self.lm_head.weight = self.transformer.wte.weight
     # Apply Initialization
     self.apply(self._initalization)
 
@@ -417,27 +417,29 @@ class GPT(nn.Module):
     x_ve_input = self.transformer.ve_te(x) if 've_te' in self.transformer else x
     # Tokens -> Embeddings
     x =  self.transformer.wte(x) # x -> (B, tokens, embs)
+    x = norm(x)
     # Smear Gate
     if self.config.smear_gate_flag:
-        gate = torch.sigmoid(self.smear_gate(x[:,:-1,:self.config.n_embd_smear_gate]))
+        gate = torch.sigmoid(self.smear_gate(x[:,1:,:self.config.n_embd_smear_gate]))
         prev = F.pad(self.smear_lambda * gate * x[:,:-1], (0,0,1,0)) # can't do x[:,1:] += ... directly — in-place ops corrupt autograd's tape, backward would read mutated values instead of originals → wrong gradients
         x = x + prev
     # Pass Input in Transformer Layers
     x0 = x.clone() # Save x0
     for i, (layer, char) in enumerate(zip(self.transformer.h, self.att_mask_patt)):
-        resid_lambdas = self.resid_lambdas[i].repeat(self.repetition)
-        x0_lambdas = self.x0_lambdas[i].repeat(self.repetition)
+        resid_lambdas = self.resid_lambdas[i].repeat_interleave(self.repetition)
+        x0_lambdas = self.x0_lambdas[i].repeat_interleave(self.repetition)
         x = resid_lambdas * x + x0_lambdas * x0
         x = layer(x, char, x_ve_input)
         if self.config.backout_flag:
             if i == (self.backout_layer - 1) : x_backout =  x.clone()
     if self.config.backout_flag: x = x - self.backout_lambda * x_backout
-    # Apply LayerNorm
-    x = self.transformer.ln_f(x)
+    # Apply RMSNorm
+    x = norm(x)
     # lm_head -> Get Logits
     logits = self.lm_head(x)
     # Apply logits softcap
     logits = self.config.logit_softcap * torch.tanh(logits/self.config.logit_softcap)
+    logits = logits.float()
     # Return Loss, Logits
     loss = None
     if targets is not None:  loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1))
