@@ -16,9 +16,6 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from functools import partial
-
-from transformers.models.gemma import configuration_gemma
-
 from HellaSwag import render_example, iterate_examples
 
 
@@ -743,7 +740,7 @@ for step in range(config.training_steps):
     lr = lr_getter(step)
     # for param_group in optimizer.param_groups:  -----> Becasue we are using the MuonAdamW optimizer, we don't need to set the lr for each param group, we just pass it to the step function
     #     param_group['lr'] = lr
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.) # This Makes Normalization for the Norm of the Gradients proportionally, so that -> root(sum(grads**2)) <= 1
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.) # This Makes Normalization for the Norm of the Gradients proportionally, so that -> root(sum(grads**2)) <= 1
     optimizer.step(lr)
     optimizer.zero_grad()
     if device_type == 'cuda' : torch.cuda.synchronize() # so that the cpu don't run the next command while the GPU still hasn't Finished
