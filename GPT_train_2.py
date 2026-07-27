@@ -7,7 +7,6 @@ import numpy as np
 
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
-from flash_attn import flash_attn_func
 from typing import Optional
 import torch.distributed as dist
 
@@ -55,7 +54,7 @@ class GPT_config:
     mpl_expantion_term: int = 4                 # That is at the MLP linear layers   layer1 : (n_embd -> mpl_expantion_term * n_embd), ....
 
     # data
-    bs: int = 16                                # per-GPU micro batch
+    bs: int = 4                                 # per-GPU micro batch
     tokenizer: str = 'gpt2'
     tot_bs_for_grad_accum: int = 131072
     # for the training shards
@@ -133,6 +132,9 @@ class GPT_config:
 
     # Blending the EmbeddingTable weights with FinalLinearLayer weights
     blend_lm_head_wte_weights: bool = True
+
+    # Use Flash Attention
+    use_flash_attn_func_flag: bool = False
 
 
 ###_________________________ OPTIMIZER _______________________________________
@@ -219,7 +221,7 @@ class MuonAdamW:
             step_sz = (unbiased_v_mean_avg + self.eps).rsqrt()
             scaled_sq_sum = (v_mean * red_dim_sz) * step_sz.square()
             v_norm_new = scaled_sq_sum.sum(dim=(-1, -2), keepdim=True).sqrt()
-            final_scale = step_sz * (v_norm / v_norm_new)
+            final_scale = step_sz * (v_norm / (v_norm_new + self.eps))
             g = g * final_scale
 
             # Update
@@ -273,7 +275,7 @@ class RoPE(nn.Module):
         return self._rotation(x, angles)
 
 
-###_________________________ NORMALIZATION + VE FLAG HELPERS ___________________________
+###_________________________ NORMALIZATION + VE FLAG HELPERS + SLIDING WINDOW ATTENTION ___________________________
 
 def norm(x, eps=1e-6):
     """RMSNorm without learnable weight."""
@@ -284,6 +286,20 @@ def compute_ve_flag(layer_idx, n_layers, ve_per_n_layers):
     """Decide whether this layer should receive Value Residual injection."""
     is_alternating = layer_idx % ve_per_n_layers == (n_layers - 1) % ve_per_n_layers
     return is_alternating or layer_idx == (n_layers - 1)  # is alternating or the last layer
+
+def sliding_window_attn(q, k, v, sequence_length, group_size, window_size):
+    # Manually expand K,V from n_kv_head → n_head (so we don't need enable_gqa)
+    # This lets SDPA use FlashAttention/efficient backend freely
+    k_exp = k.repeat_interleave(group_size, dim=1)  # (B, n_head, T, head_sz)
+    v_exp = v.repeat_interleave(group_size, dim=1)  # (B, n_head, T, head_sz)
+
+    # Bool mask — SDPA dispatches to memory-efficient backend (no O(T²) storage)
+    rows = torch.arange(sequence_length, device=q.device).unsqueeze(1)  # (T, 1)
+    cols = torch.arange(sequence_length, device=q.device).unsqueeze(0)  # (1, T)
+    window_mask = (cols <= rows) & ((rows - cols) <  window_size)  # (T, T) bool
+
+    wei = F.scaled_dot_product_attention(q, k_exp, v_exp, attn_mask=window_mask)
+    return wei
 
 
 ###_________________________ CREATING THE MODEL _______________________________________
@@ -302,6 +318,7 @@ class CausalMultiHeadAttention(nn.Module):
         self.n_embd_ve_gate = config.n_embd_ve_gate
         self.ATTN_IDX = idx
         self.ve_flag = False
+        self.use_flash_attn_func_flag = config.use_flash_attn_func_flag
         # assert errors
         assert self.n_head % self.n_kv_head == 0, f"n_head: {self.n_head}, n_kv_head: {self.n_kv_head} Aren't Divisible"
         assert self.n_embd % self.n_head == 0, f"Number of Embeddings: {self.n_embd},  must be a multiple of n_head: {self.n_head}"
@@ -350,14 +367,18 @@ class CausalMultiHeadAttention(nn.Module):
         q, k = q * 1.2, k * 1.2
         # Run FlashAttention (IF char == L)
         if char == 'L':
-            wei = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)  # enable_gqa=True -> is more efficient that reshaping and expanding ourselves
-            wei = wei.transpose(1, 2).reshape(b, t, c)                                      # Combine the heads back
+            wei = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)      # enable_gqa=True -> is more efficient that reshaping and expanding ourselves
+            wei = wei.transpose(1, 2).reshape(b, t, c)                                          # Combine the heads back
 
         # Run FlashAttention (IF char == S)
         if char == 'S':
-            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)               # Because the flash_attn_func expects -> (B, T, n_head, head_sz) not (B, n_head, T, head_sz)
-            wei = flash_attn_func(q, k, v, causal=True, window_size=(self.window_size, 0))  # (left=window, right=0) -> only look back window tokens, never forward | causal=True is already what blocks future tokens but Both together are redundant but harmless.
-            wei = wei.reshape(b, t, c)                                                      # Combine the heads back
+            if self.use_flash_attn_func_flag:
+                q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)               # Because the flash_attn_func expects -> (B, T, n_head, head_sz) not (B, n_head, T, head_sz)
+                wei = flash_attn_func(q, k, v, causal=True, window_size=(self.window_size, 0))  # (left=window, right=0) -> only look back window tokens, never forward | causal=True is already what blocks future tokens but Both together are redundant but harmless.
+                wei = wei.reshape(b, t, c)
+            else:
+                wei = sliding_window_attn(q, k, v, t, self.group_sz, self.window_size)
+                wei = wei.transpose(1, 2).reshape(b,t, c)                                       # Combine the heads back
 
         # return the projection
         return self.c_proj(wei)
@@ -483,8 +504,8 @@ class GPT(nn.Module):
         """Build either plain AdamW or MuonAdamW param groups."""
         params_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
 
-        # Embedding / unembedding must NOT go through Muon's Newton-Schulz step
-        no_muon_names = {'transformer.wte.weight', 'lm_head.weight'}
+        # ANY embedding table must skip Muon
+        no_muon_names = {f"{mod_name}.weight" for mod_name, mod in self.named_modules() if isinstance(mod, nn.Embedding)} # self.named_modules() -> PyTorch method that recursively walks through every submodule in model and yields (name, module) pairs.
 
         if optimizer is None:
             decay_params = [p for pn, p in params_dict.items() if p.dim() >= 2]
@@ -599,6 +620,9 @@ torch.set_float32_matmul_precision('high')
 
 # config
 config = GPT_config()
+
+# Import flash_attn_func if going to be used
+if config.use_flash_attn_func_flag: from flash_attn import flash_attn_func
 
 # make device_type
 device_type = "cuda" if config.device.startswith("cuda") else "cpu" # just to use it at the autocast, etc... and make 'cuda:3' -> 'cuda', 'cuda' -> 'cuda' ,etc...
@@ -750,7 +774,7 @@ for step in range(config.training_steps):
     time_taken = end - start
     tokens_count = train_dl.block_size * train_dl.bs * train_dl.tot_mini_batches
     if master_process:
-        print(f'Step: {step:5d} | Loss: {accum_loss.item():.4f} | lr = {lr:.6f} | Norm = {norm:6f} | Time: {time_taken:.4f}sec | Token/sec: {(tokens_count / time_taken):.3f}')
+        print(f'Step: {step:5d} | Loss: {accum_loss.item():.4f} | lr = {lr:.6f} | Grad_Norm = {grad_norm:6f} | Time: {time_taken:.4f}sec | Token/sec: {(tokens_count / time_taken):.3f}')
         with open(log_file, 'a') as f: f.write(f"{step} train {accum_loss.item():.6f}\n")
 
 if ddp: destroy_process_group() # Clean After the Multi-GPU Process
