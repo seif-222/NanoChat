@@ -22,7 +22,7 @@ from HellaSwag import render_example, iterate_examples
 
 ddp = int(os.environ.get('RANK', -1)) != -1
 if ddp:
-    assert torch.cuda.is_available(), f'There is not cude for the device to run ddp'
+    assert torch.cuda.is_available(), f'There is not cuda for the device to run ddp'
     init_process_group(backend='nccl')
     ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
@@ -45,28 +45,27 @@ else:
 class GPT_config:
     """All hyperparameters and flags for the model, data, optimizer and training."""
 
-    # model
-    n_embd: int = 1024
-    n_head: int = 8
+    # -------------------- model architecture --------------------
+    n_embd: int = 768
+    n_head: int = 6
     n_layer: int = 8
-    vocab_size: int = 50304
-    block_size: int = 512                       # Just a number that is divisible by 2 more times that the standard 50257
-    mpl_expantion_term: int = 4                 # That is at the MLP linear layers   layer1 : (n_embd -> mpl_expantion_term * n_embd), ....
+    vocab_size: int = 50304                 # Just a number that is divisible by 2 more times than the standard 50257
+    block_size: int = 512
+    mpl_expantion_term: int = 4             # That is at the MLP linear layers   layer1 : (n_embd -> mpl_expantion_term * n_embd), ....
 
-    # data
-    bs: int = 4                                 # per-GPU micro batch
+    # -------------------- data --------------------
+    bs: int = 8                             # per-GPU micro batch
     tokenizer: str = 'gpt2'
     tot_bs_for_grad_accum: int = 131072
-    # for the training shards
     data_root: str = "/kaggle/input/datasets/seif222/gpt-train-kaggle-zero-to-hero"   # <- point at your actual shards
 
-    # optim sched
+    # -------------------- optimizer schedule --------------------
     max_lr: float = 6e-4
     min_lr_ratio: float = 0.1
     warmup_steps: int = 10
     max_steps: int = 900
 
-    # optim
+    # -------------------- optimizer --------------------
     beta1: float = 0.9
     beta2: float = 0.95
     eps: float = 1e-8
@@ -76,62 +75,55 @@ class GPT_config:
     steps: int = 5
     Nesterov: bool = True
 
-    # training & Validation
-    training_steps: int = 1000                   # = max_steps
+    # -------------------- training & validation --------------------
+    training_steps: int = 1000              # = max_steps
     val_after_step: int = 100
     val_loss_accum_steps: int = 5
-
-    # CheckPoint
     checkpoint_after_steps: int = 50
 
-    # device
+    # -------------------- device / multi-GPU --------------------
     device: str = device
-
-    # Multi-Device Training
     process_rank: int = ddp_rank
     num_processes: int = ddp_world_size
 
-    # Options
-    # validaiton
+    # -------------------- options / feature flags --------------------
     validation: bool = True
-    # sampling
     model_sampling: bool = True
     num_sequence: int = 3
     max_length: int = 40
-    #compile
-    use_compile: bool = False                    # note: compile breaks HellaSwag/gen
+    use_compile: bool = False               # note: compile breaks HellaSwag/gen
 
     # RoPE
-    base: int = 10000
+    base: int = 100000
 
-    # For GQA
+    # GQA
     n_kv_head: int = 2
 
     # Sliding window
-    mask_pattern: str = 'SSL'
-    window_size: int = 32
+    mask_pattern: str = 'SSSL'
+    window_size: int = 128
 
     # Value Residual Injection
-    n_embd_ve_gate: int = 24
-    Table_embds_per_layer: bool = True
-    ve_per_n_layers: int = 2                     # how much do we want to apply it  (per n layers)
+    n_embd_ve_gate: int = 12
+    Table_embds_per_layer: bool = False
+    ve_per_n_layers: int = 2                # how much do we want to apply it  (per n layers)
 
-    # per layer scalars
-    num_per_layer_scalars: int = 1               # 1 is the default
+    # per-layer scalars
+    num_per_layer_scalars: int = 1          # 1 is the default
 
     # SmearGate
     smear_gate_flag: bool = True
     n_embd_smear_gate: int = 24
 
-    # Backout                                   -> Removing the Intermediate or Middle of output of Transformer from the final layer
+    # Backout  -> Removing the Intermediate or Middle of output of Transformer from the final layer
     backout_flag: bool = True
-    backout_layer: Optional[int] = None         # the default if it was none -> n_layer//2     - NOTE: first_layer_idx = 1
+    backout_layer: Optional[int] = None     # the default if it was none -> n_layer//2     - NOTE: first_layer_idx = 1
 
     # Logit Softcap
     logit_softcap: int = 15
 
     # Blending the EmbeddingTable weights with FinalLinearLayer weights
-    blend_lm_head_wte_weights: bool = True
+    blend_lm_head_wte_weights: bool = False
 
     # Use Flash Attention
     use_flash_attn_func_flag: bool = False
@@ -171,6 +163,7 @@ class MuonAdamW:
         if use_muon is None:
             use_muon = (p.dim() >= 2)   # fallback for old-style groups
 
+        ### 1. -------- AdamW -----------
         if not use_muon:
             if not hasattr(p, 'grad_avg'): p.grad_avg = torch.zeros_like(p.grad.data)
             if not hasattr(p, 'grad_sqr_avg'): p.grad_sqr_avg = torch.zeros_like(p.grad.data)
@@ -181,7 +174,10 @@ class MuonAdamW:
             update = unbiased_grad_avg / (unbiased_grad_sqr_avg.sqrt() + self.eps)
             if wd: update += wd * p.data
             p.data.sub_(lr * update)
+
+        ### 2. -------- Muon ------------
         else:
+            # Save grad at g
             g = p.grad.data
 
             # Nesterov momentum
@@ -239,7 +235,9 @@ class RoPE(nn.Module):
         super().__init__()
         inv_freq = self._create_inv_freq(config.n_embd // config.n_head, config.base)
         self.sequence_length = config.block_size
-        self.register_buffer('angles', self._create_angles(inv_freq, self.sequence_length).unsqueeze(0))
+        angles =  self._create_angles(inv_freq, self.sequence_length).unsqueeze(0)
+        self.register_buffer('sin_angles', angles.sin())
+        self.register_buffer('cos_angles', angles.cos())
 
     def _create_inv_freq(self, head_dim, base=10000):
         dim = head_dim // 2
@@ -252,12 +250,9 @@ class RoPE(nn.Module):
         angles = positions[:, None] * inv_freq[None, :]
         return angles
 
-    def _rotation(self, x, angles):
+    def _rotation(self, x, sin_angles, cos_angles):
         x1 = x[..., :x.shape[-1]//2]
         x2 = x[..., x.shape[-1]//2:]
-
-        sin_angles = angles.sin()
-        cos_angles = angles.cos()
 
         # Applying the rotation matrix
         y1 = x1 * cos_angles - x2 * sin_angles
@@ -270,33 +265,45 @@ class RoPE(nn.Module):
         seq_len = x.shape[-2]
         assert seq_len <= self.sequence_length, f"Input Sequence Length for RoPE: {seq_len} should be <= The initialized Sequence Length: {self.sequence_length}"
         # create angles
-        angles = self.angles.to(device=x.device, dtype=x.dtype)
-        angles = angles[:, :seq_len]
-        return self._rotation(x, angles)
+        sin_angles = self.sin_angles[:,:seq_len].to(device=x.device, dtype=x.dtype)
+        cos_angles = self.cos_angles[:,:seq_len].to(device=x.device, dtype=x.dtype)
+        return self._rotation(x, sin_angles, cos_angles)
 
 
-###_________________________ NORMALIZATION + VE FLAG HELPERS + SLIDING WINDOW ATTENTION ___________________________
+###_________________________ HELPER FUNCTIONS ___________________________
 
+# 1. ------- Normalization -------
 def norm(x, eps=1e-6):
     """RMSNorm without learnable weight."""
     return F.rms_norm(x, (x.shape[-1],), weight=None, eps=eps)  # RMS normalization with epsilon for numerical stability
 
 
+# 2. ------- VE Flag Helper --------
 def compute_ve_flag(layer_idx, n_layers, ve_per_n_layers):
     """Decide whether this layer should receive Value Residual injection."""
     is_alternating = layer_idx % ve_per_n_layers == (n_layers - 1) % ve_per_n_layers
     return is_alternating or layer_idx == (n_layers - 1)  # is alternating or the last layer
 
+# 3. --------- Parameters Initialization ------------- * for nn.Parameters * (n_layers, resid_lambda, x0_lambda, backout_lambda)
+@torch.no_grad()
+def init_params(n_layer, resid_lambdas, x0_lambdas, backout_lambda=None):
+    for i in range(n_layer):
+        resid_lambdas.data[i] = 1.15 - (0.10 * i / max(n_layer - 1, 1))
+        x0_lambdas.data[i]    = 0.20 - (0.15 * i / max(n_layer - 1, 1))
+    if backout_lambda is not None:
+        backout_lambda.data.fill_(0.2)
+
+# 4. ------- Sliding Window Attention ---------
 def sliding_window_attn(q, k, v, sequence_length, group_size, window_size):
-    # Manually expand K,V from n_kv_head → n_head (so we don't need enable_gqa)
-    # This lets SDPA use FlashAttention/efficient backend freely
+    """ Create Sliding Window Attention where, make the mask then use F.scaled_dot_product_attention()"""
+    # Manually expand K,V from n_kv_head → n_head
     k_exp = k.repeat_interleave(group_size, dim=1)  # (B, n_head, T, head_sz)
     v_exp = v.repeat_interleave(group_size, dim=1)  # (B, n_head, T, head_sz)
-
-    # Bool mask — SDPA dispatches to memory-efficient backend (no O(T²) storage)
+    # Bool mask
     rows = torch.arange(sequence_length, device=q.device).unsqueeze(1)  # (T, 1)
     cols = torch.arange(sequence_length, device=q.device).unsqueeze(0)  # (1, T)
-    window_mask = (cols <= rows) & ((rows - cols) <  window_size)  # (T, T) bool
+    # Create Mask
+    window_mask = (cols <= rows) & ((rows - cols) <= window_size)  # (T, T) bool
 
     wei = F.scaled_dot_product_attention(q, k_exp, v_exp, attn_mask=window_mask)
     return wei
@@ -304,13 +311,16 @@ def sliding_window_attn(q, k, v, sequence_length, group_size, window_size):
 
 ###_________________________ CREATING THE MODEL _______________________________________
 
+
+# 1. ---------- Attention ------------
+
 class CausalMultiHeadAttention(nn.Module):
     """Causal multi-head attention with GQA, optional sliding window, RoPE and Value Residual."""
 
-    def __init__(self, config, idx):
+    def __init__(self, config, idx, rope):
         super().__init__()
         # Save attr
-        self.rope = RoPE(config)
+        self.rope = rope
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.n_kv_head = config.n_kv_head
@@ -319,21 +329,26 @@ class CausalMultiHeadAttention(nn.Module):
         self.ATTN_IDX = idx
         self.ve_flag = False
         self.use_flash_attn_func_flag = config.use_flash_attn_func_flag
+
         # assert errors
         assert self.n_head % self.n_kv_head == 0, f"n_head: {self.n_head}, n_kv_head: {self.n_kv_head} Aren't Divisible"
         assert self.n_embd % self.n_head == 0, f"Number of Embeddings: {self.n_embd},  must be a multiple of n_head: {self.n_head}"
         assert self.window_size <= config.block_size, f'Window size: {self.window_size} should be <= block_size: {config.block_size}'
         assert config.ve_per_n_layers <= config.n_layer, f"ve_per_n_layers: {config.ve_per_n_layers} can't be > {config.n_layer}"
         if not config.Table_embds_per_layer: assert self.n_embd_ve_gate <= self.n_embd, f'Number of Embeddings in ve_Gate Residual: {self.n_embd_ve_gate}  should be <= Number of Embeddings: {self.n_embd}'
+
         # Group and Head size
         self.head_sz = self.n_embd // self.n_head
         self.group_sz = self.n_head // self.n_kv_head
+
         # qkv
         self.q_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.kv_proj = nn.Linear(self.n_embd, 2 * self.head_sz * self.n_kv_head, bias=False)
+
         # Projection
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.INIT_SPECIAL_STD = 1
+
         # Gate Linear & Embedding Table (if True) -> For the Value Embeddings / depending on n chosen for the frequency of ve
         if compute_ve_flag(self.ATTN_IDX, config.n_layer, config.ve_per_n_layers):
             self.ve_flag = True
@@ -344,27 +359,34 @@ class CausalMultiHeadAttention(nn.Module):
     def forward(self, x, char, x_ve_input):  # x -> (B, T, E)     | x_ve_input -> (token_indicies: in case of there is a ve_embd_table_per_layer),
         # shapes                                                               -> (ve_embeddings: in case of there is a Global ve_embd_table)
         b, t, c = x.shape
+
         # get qkv
         q = self.q_proj(x)
         kv = self.kv_proj(x)
         k, v = torch.chunk(kv, 2, dim=-1)
+
         # Make them 4D shaped
         q = q.reshape(b, t, self.n_head, self.head_sz).transpose(1, 2)                      # -> (B, n_head, T, head_sz)
         k = k.reshape(b, t, self.n_kv_head, self.head_sz).transpose(1, 2)                   # -> (B, n_kv_head, T, head_sz)
         v = v.reshape(b, t, self.n_kv_head, self.head_sz)                                   # -> (B, T, n_kv_head, head_sz), We are not going to transpose now to make VE work, then we transpose
+
         # Add the Gate,ve to V
         if self.ve_flag:
             gate = 3 * torch.sigmoid(self.ve_gate(x[:, :, :self.n_embd_ve_gate]))                         # -> (B,T,C[:n]) -> (B,T,n_kv_head)
             if x_ve_input is not None: ve = self.ve(x_ve_input).view(b, t, self.n_kv_head, self.head_sz)  # (B,T, head_sz * n_kv_head) -> (B,T, n_kv_head, head_sz)
             else: raise ValueError("Missing required inputs: You must provide either 'x_ve' or 'x_ve_indicies' For ValueEmbeddings to Work")
             v = v + gate.unsqueeze(-1) * ve   # unsqueeze -> ( B, T, n_kv_head, 1)
+
         # Transpose V
         v = v.transpose(1, 2)                 # -> (B, n_kv_head, T, head_sz)
+
         # apply RoPE
         q, k = self.rope(q), self.rope(k)
+
         # Normalization & Rescaling
         q, k = norm(q), norm(k)
         q, k = q * 1.2, k * 1.2
+
         # Run FlashAttention (IF char == L)
         if char == 'L':
             wei = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)      # enable_gqa=True -> is more efficient that reshaping and expanding ourselves
@@ -378,11 +400,13 @@ class CausalMultiHeadAttention(nn.Module):
                 wei = wei.reshape(b, t, c)
             else:
                 wei = sliding_window_attn(q, k, v, t, self.group_sz, self.window_size)
-                wei = wei.transpose(1, 2).reshape(b,t, c)                                       # Combine the heads back
+                wei = wei.transpose(1, 2).reshape(b, t, c)                                       # Combine the heads back
 
         # return the projection
         return self.c_proj(wei)
 
+
+# 2. ---------- MLP ------------
 
 class MLP(nn.Module):
     """Simple MLP with ReLU² activation."""
@@ -397,18 +421,22 @@ class MLP(nn.Module):
         return self.c_proj(F.relu(self.c_fc(x)).square())   # Made the Activation as the ReLU^2
 
 
+# 3. ---------- Transformer Block ------------
+
 class Block(nn.Module):
     """Transformer block = Attention + MLP (both with pre-norm)."""
 
-    def __init__(self, config, idx):
+    def __init__(self, config, idx, rope):
         super().__init__()
-        self.attn = CausalMultiHeadAttention(config, idx)
+        self.attn = CausalMultiHeadAttention(config, idx, rope)
         self.mlp = MLP(config)
 
     def forward(self, x, char, x_ve_input=None):
         x = x + self.attn(norm(x), char, x_ve_input)
         return x + self.mlp(norm(x))
 
+
+# 4. ---------- GPT ------------
 
 class GPT(nn.Module):
     """Main GPT model with optional SmearGate, Backout, Value Residual, GQA, etc."""
@@ -417,42 +445,52 @@ class GPT(nn.Module):
         super().__init__()
         # save attr
         self.config = config
+
         # Expand the attention masking pattern & assert & Make mask UpperCase
         config.mask_pattern = config.mask_pattern.upper()
         assert config.n_layer >= len(config.mask_pattern), f'n_layer:{config.n_layer}  must be >= len(mask_pattern):{len(config.mask_pattern)}'
         assert all(c in 'SL' for c in config.mask_pattern), f'All chars in mask pattern: {config.mask_pattern} should be -> S or L'
         self.att_mask_patt = (config.n_layer * config.mask_pattern)[:config.n_layer - 1] + 'L'
+
         # Per_Layer_Scalars -> assert & repetition_attr, etc...
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer, config.num_per_layer_scalars))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer, config.num_per_layer_scalars))
         assert config.n_embd % config.num_per_layer_scalars == 0, f"num_per_layer_scalars: {config.num_per_layer_scalars}  Must be <=  n_emb: {config.n_embd}  && n_emb: {config.n_embd} should be divisible by num_per_layer_scalars: {config.num_per_layer_scalars}"
         self.repetition = config.n_embd // config.num_per_layer_scalars
+
         # Smear_Gate & Assert
         if config.smear_gate_flag:
             assert config.n_embd_smear_gate <= config.n_embd, f'Number of Embeddings in Smear_Gate: {config.n_embd_smear_gate}  should be <= Number of Embeddings: {config.n_embd}'
             self.smear_gate = nn.Linear(config.n_embd_smear_gate, 1, bias=False)  # That is for like Based on who I'm Now, How much do I depend on the token Before me
             self.smear_lambda = nn.Parameter(torch.zeros(1))                      # Scaling Factor
+
         # backout
         if config.backout_flag:
             self.backout_lambda = nn.Parameter(torch.zeros(1))
             self.backout_layer = config.n_layer // 2 if config.backout_layer is None else config.backout_layer
             assert 0 < self.backout_layer < config.n_layer, f"backout_layer: {self.backout_layer} must be between 1 and n_layer: {config.n_layer}"
+
         # Make the Transformer
+        rope = RoPE(config)    # Make the RoPE
         transformer_modules = {
             'wte': nn.Embedding(config.vocab_size, config.n_embd),
-            'h': nn.ModuleList([Block(config, idx) for idx in range(config.n_layer)]),
+            'h': nn.ModuleList([Block(config, idx, rope) for idx in range(config.n_layer)]),
         }
         # add ve_TableEmbedding if True
         if not config.Table_embds_per_layer:
             transformer_modules['ve_te'] = nn.Embedding(config.vocab_size, config.n_embd_ve_gate)
         # make the module
         self.transformer = nn.ModuleDict(transformer_modules)
+
         # Make the head
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # Make the last Linear later the same as the embedding layer
         if config.blend_lm_head_wte_weights: self.lm_head.weight = self.transformer.wte.weight
+
         # Apply Initialization
         self.apply(self._initalization)
+        backout_lambda = self.backout_lambda if config.backout_flag else None
+        init_params(config.n_layer, self.resid_lambdas, self.x0_lambdas, backout_lambda)
 
     def _initalization(self, module):
         """Custom weight initialization (special std for residual projections)."""
@@ -468,33 +506,45 @@ class GPT(nn.Module):
         # Shape & Assert
         B, T = x.shape
         assert T <= self.config.block_size, f'The Context Exceeds the block size {T} > {self.config.block_size}'
+
         # get the VE_input
         x_ve_input = self.transformer.ve_te(x) if 've_te' in self.transformer else x
+
         # Tokens -> Embeddings
         x = self.transformer.wte(x)  # x -> (B, tokens, embs)
         x = norm(x)
+
         # Smear Gate
         if self.config.smear_gate_flag:
             gate = torch.sigmoid(self.smear_gate(x[:, 1:, :self.config.n_embd_smear_gate]))
             prev = F.pad(self.smear_lambda * gate * x[:, :-1], (0, 0, 1, 0))  # can't do x[:,1:] += ... directly — in-place ops corrupt autograd's tape, backward would read mutated values instead of originals → wrong gradients
             x = x + prev
+
         # Pass Input in Transformer Layers
         x0 = x.clone()  # Save x0
         for i, (layer, char) in enumerate(zip(self.transformer.h, self.att_mask_patt)):
+            # resid_lambdas & x0_lambdas
             resid_lambdas = self.resid_lambdas[i].repeat_interleave(self.repetition)
             x0_lambdas = self.x0_lambdas[i].repeat_interleave(self.repetition)
             x = resid_lambdas * x + x0_lambdas * x0
+            # Pass through layer
             x = layer(x, char, x_ve_input)
+            # Backout
             if self.config.backout_flag:
                 if i == (self.backout_layer - 1): x_backout = x.clone()
+        # Backout
         if self.config.backout_flag: x = x - self.backout_lambda * x_backout
+
         # Apply RMSNorm
         x = norm(x)
+
         # lm_head -> Get Logits
         logits = self.lm_head(x)
+
         # Apply logits softcap
         logits = self.config.logit_softcap * torch.tanh(logits / self.config.logit_softcap)
         logits = logits.float()
+
         # Return Loss, Logits
         loss = None
         if targets is not None: loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1))
@@ -505,11 +555,13 @@ class GPT(nn.Module):
         params_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
 
         # ANY embedding table must skip Muon
-        no_muon_names = {f"{mod_name}.weight" for mod_name, mod in self.named_modules() if isinstance(mod, nn.Embedding)} # self.named_modules() -> PyTorch method that recursively walks through every submodule in model and yields (name, module) pairs.
+        # also exclude the 2-D per-layer scalar parameters & smear_gate so they do not receive weight-decay (AdamW path) nor Newton-Schulz orthogonalization (Muon path)
+        no_muon_names = {f"{mod_name}.weight" for mod_name, mod in self.named_modules() if isinstance(mod, nn.Embedding)}
+        no_muon_names |= {'resid_lambdas', 'x0_lambdas', 'smear_gate.weight'} # |=   is the same as   .update({set})
 
         if optimizer is None:
-            decay_params = [p for pn, p in params_dict.items() if p.dim() >= 2]
-            no_decay_params = [p for pn, p in params_dict.items() if p.dim() < 2]
+            decay_params = [p for pn, p in params_dict.items() if p.dim() >= 2 and pn not in no_muon_names]
+            no_decay_params = [p for pn, p in params_dict.items() if p.dim() < 2 or pn in no_muon_names]
             optim_group = [
                 {'params': decay_params, 'weight_decay': self.config.weight_decay},
                 {'params': no_decay_params, 'weight_decay': 0.},
@@ -520,10 +572,8 @@ class GPT(nn.Module):
                                      betas=(self.config.beta1, self.config.beta2),
                                      eps=self.config.eps, fused=use_fuse)
         else:
-            muon_params = [p for pn, p in params_dict.items()
-                           if p.dim() >= 2 and pn not in no_muon_names]
-            adam_params = [p for pn, p in params_dict.items()
-                           if p.dim() < 2 or pn in no_muon_names]
+            muon_params = [p for pn, p in params_dict.items() if p.dim() >= 2 and pn not in no_muon_names]
+            adam_params = [p for pn, p in params_dict.items() if p.dim() < 2 or pn in no_muon_names]
             optim_group = [
                 {'params': muon_params, 'weight_decay': self.config.weight_decay, 'use_muon': True},
                 {'params': adam_params, 'weight_decay': 0., 'use_muon': False},
@@ -533,28 +583,29 @@ class GPT(nn.Module):
                              steps=self.config.steps, red_dim=self.config.red_dim,
                              Nesterov=self.config.Nesterov)
 
+
 ###______________________________________ MAKE A DATALOADER ________________________________
 
+# 1. -------- Load_Token Helper Function ---------
 def load_tokens(filename):
     np_loaded = np.load(filename)
     np_loaded = np_loaded.astype(np.int32) # convert uint16 to int32 before cast to long, otherwise pytorch doesn't like it
     return torch.tensor(np_loaded, dtype=torch.long)
 
 
-
-
-# Make DL lite
+# 2. --------- Make DL lite ------------
 class DL_lite:
     def __init__(self, config, split):
         assert split in {'Train', 'Val'}, 'Split must be one of "Train" or "Val"'
         # store attr
-        self.block_size= config.block_size
+        self.block_size = config.block_size
         self.process_rank = config.process_rank
         self.num_processes = config.num_processes
         self.bs = config.bs
-        assert config.tot_bs_for_grad_accum % (self.bs * config.num_processes) == 0, f' Total_Batch_size: {config.tot_bs_for_grad_accum} is not divisible by Batch_size: {self.bs} * Num_processes: {self.num_processes}'
+        assert config.tot_bs_for_grad_accum % (self.bs * self.block_size * config.num_processes) == 0, f'Total_Batch_size: {config.tot_bs_for_grad_accum} is not divisible by bs: {self.bs} * block_size: {self.block_size} * num_processes: {config.num_processes}'
         grad_accum = bool(config.tot_bs_for_grad_accum)
         self.tot_mini_batches = config.tot_bs_for_grad_accum // (self.bs * self.block_size * self.num_processes) if grad_accum else 1
+
         # Loading the data
         data_root = config.data_root
         shards = os.listdir(data_root)
@@ -563,6 +614,7 @@ class DL_lite:
         self.shards = [os.path.join(data_root, s) for s in shards]
         assert len(shards) > 0, f"no shards found for split {split}"
         if master_process: print(f'Found Shards =  {len(self.shards)} | Split = {split} | Total Batch Size = {config.tot_bs_for_grad_accum} | Grad Accum = {grad_accum} | Number Mini Batches = {self.tot_mini_batches} | Num_processes: {self.num_processes}')
+
         # Make a trackers
         self.reset()
 
@@ -582,8 +634,8 @@ class DL_lite:
             self.tr = self.bs * self.block_size * self.process_rank
         return x, y
 
-###_________________________________ HELLASWAG FUNCTION _______________written in HellaSwag.py________________________________
 
+###_________________________________ HELLASWAG FUNCTION _______________ written in HellaSwag.py ________________________________
 
 def get_most_likely_row(tokens, mask, logits):
     shift_logits = (logits[:, :-1, :]).contiguous()
@@ -599,6 +651,7 @@ def get_most_likely_row(tokens, mask, logits):
     norm_preds = torch.argmin(avg_loss).item()
 
     return norm_preds
+
 
 ###_________________________________ LR SCHED _______________________________________________
 
@@ -654,8 +707,8 @@ log_file = os.path.join(log_dir, 'log.txt')
 with open(log_file, 'w') as f: # open for writing to clear the file
     pass
 
-##_____________________________________  TRAINING  ______________________________________
 
+##_____________________________________  TRAINING  ______________________________________
 
 # Training Loop
 for step in range(config.training_steps):
@@ -690,7 +743,6 @@ for step in range(config.training_steps):
                     'val_loss': val_accum_loss.item()
                 }
                 torch.save(checkpoint, checkpoint_path)
-
 
     # Model Sampling
     if step % config.val_after_step == 0 and step > 0 and config.model_sampling and (not config.use_compile):
@@ -747,13 +799,12 @@ for step in range(config.training_steps):
             print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
             with open(log_file, "a") as f:  f.write(f"{step} hella {acc_norm:.4f}\n")
 
-
     # Training
     model.train()
     accum_loss = 0
     for mini_step in range(train_dl.tot_mini_batches):
-        x,y = train_dl.after_batch()
-        x,y = x.to(config.device), y.to(config.device)
+        x, y = train_dl.after_batch()
+        x, y = x.to(config.device), y.to(config.device)
         if ddp:  model.require_backward_grad_sync = (mini_step == train_dl.tot_mini_batches - 1) # So that we avoid unnecessary communication during backward () unless it is the last step
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
             logits, loss = model(x, y)
@@ -762,7 +813,7 @@ for step in range(config.training_steps):
         loss.backward()
     if ddp:  dist.all_reduce(accum_loss, op= dist.ReduceOp.AVG) # Averaging the Loss Across all the Processes
     lr = lr_getter(step)
-    # for param_group in optimizer.param_groups:  -----> Becasue we are using the MuonAdamW optimizer, we don't need to set the lr for each param group, we just pass it to the step function
+    # for param_group in optimizer.param_groups:  -----> Because we are using the MuonAdamW optimizer, we don't need to set the lr for each param group, we just pass it to the step function
     #     param_group['lr'] = lr
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.) # This Makes Normalization for the Norm of the Gradients proportionally, so that -> root(sum(grads**2)) <= 1
     optimizer.step(lr)
