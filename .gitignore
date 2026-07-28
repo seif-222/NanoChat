@@ -1,9 +1,6 @@
 # Ignore everything by default
 /*
 
-# ...except these tracked NanoChat files
-!/GPT_train_2.py
-!/gpt-train-muonadamw.ipynb
-!/HellaSwag.py
-!/MuonAdamW_Optimizer.ipynb
+# ...except the NanoChat folder and this file
+!/NanoChat/
 !/.gitignore
