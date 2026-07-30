@@ -310,16 +310,7 @@ def compute_ve_flag(layer_idx, n_layers, ve_per_n_layers):
     is_alternating = layer_idx % ve_per_n_layers == (n_layers - 1) % ve_per_n_layers
     return is_alternating or layer_idx == (n_layers - 1)  # is alternating or the last layer
 
-# 3. --------- Parameters Initialization ------------- * for nn.Parameters * (n_layers, resid_lambda, x0_lambda, backout_lambda)
-@torch.no_grad()
-def init_params(n_layer, resid_lambdas, x0_lambdas, backout_lambda=None):
-    for i in range(n_layer):
-        resid_lambdas.data[i] = 1.15 - (0.10 * i / max(n_layer - 1, 1))
-        x0_lambdas.data[i]    = 0.20 - (0.15 * i / max(n_layer - 1, 1))
-    if backout_lambda is not None:
-        backout_lambda.data.fill_(0.2)
-
-# 4. ------- Sliding Window Attention ---------
+# 3. ------- Sliding Window Attention ---------
 def sliding_window_attn(q, k, v, sequence_length, group_size, window_size):
     """ Create Sliding Window Attention where, make the mask then use F.scaled_dot_product_attention()"""
     # Manually expand K,V from n_kv_head → n_head
@@ -514,19 +505,40 @@ class GPT(nn.Module):
         if config.blend_lm_head_wte_weights: self.lm_head.weight = self.transformer.wte.weight
 
         # Apply Initialization
-        self.apply(self._initalization)
-        backout_lambda = self.backout_lambda if config.backout_flag else None
-        init_params(config.n_layer, self.resid_lambdas, self.x0_lambdas, backout_lambda)
+        self._init_weights()
 
-    def _initalization(self, module):
-        """Custom weight initialization (special std for residual projections)."""
-        if isinstance(module, nn.Linear):
-            std = 0.02
-            if hasattr(module, 'INIT_SPECIAL_STD'): std *= (2 * self.config.n_layer) ** -0.5
-            nn.init.normal_(module.weight, mean=0., std=std)  # torch.nn
-            if module.bias is not None: nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0., std=0.02)
+    def _init_weights(self):
+        n_embd = self.config.n_embd
+        s = 3 ** 0.5 * n_embd ** -0.5  # uniform bound giving the same std as Normal(0, n_embd^-0.5)
+
+        nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.8)
+        if not self.config.blend_lm_head_wte_weights:
+            nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+
+        for block in self.transformer.h:
+            nn.init.uniform_(block.attn.q_proj.weight, -s, s)
+            nn.init.uniform_(block.attn.kv_proj.weight, -s, s)
+            nn.init.zeros_(block.attn.c_proj.weight)
+            nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)
+            nn.init.zeros_(block.mlp.c_proj.weight)
+            if block.attn.ve_flag:
+                nn.init.uniform_(block.attn.ve.weight, -s, s)
+                nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
+
+        if 've_te' in self.transformer:
+            nn.init.normal_(self.transformer.ve_te.weight, mean=0.0, std=0.02)
+
+        if self.config.smear_gate_flag:
+            nn.init.uniform_(self.smear_gate.weight, 0.0, 0.02)
+            nn.init.zeros_(self.smear_lambda)
+        if self.config.backout_flag:
+            nn.init.constant_(self.backout_lambda, 0.2)
+
+        n_layer = self.config.n_layer
+        with torch.no_grad():
+            for i in range(n_layer):
+                self.resid_lambdas.data[i] = 1.15 - (0.10 * i / max(n_layer - 1, 1))
+                self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
 
     def forward(self, x, targets=None):  # x -> (B, Tokens)
         # Shape & Assert
