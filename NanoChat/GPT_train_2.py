@@ -59,18 +59,27 @@ class GPT_config:
     tot_bs_for_grad_accum: int = 131072
     data_root: str = "/kaggle/input/datasets/seif222/gpt-train-kaggle-zero-to-hero"   # <- point at your actual shards
 
-    # -------------------- optimizer schedule --------------------
-    max_lr: float = 6e-4
+    # -------------------- optimizer schedule (shape only, independent of absolute lr) --------------------
     min_lr_ratio: float = 0.1
     warmup_steps: int = 10
     max_steps: int = 900
 
-    # -------------------- optimizer --------------------
-    beta1: float = 0.9
-    beta2: float = 0.95
-    eps: float = 1e-8
-    weight_decay: float = 0.1
-    # if using the MuonAdamW
+    # -------------------- optimizer: per-group base learning rates --------------------
+    matrix_lr: float = 0.02              # Muon lr for all transformer-block matrices (q/k/v/proj/mlp/ve/ve_gate)
+    unembedding_lr: float = 0.004        # lm_head (only used when untied from wte)
+    embedding_lr: float = 0.2            # token embedding (wte), ve_te and any per-layer ve tables use half this
+    scalar_lr: float = 0.5               # base rate for x0_lambdas, resid_lambdas uses 1% of this
+
+    # -------------------- optimizer: betas / eps / decay -----(DEFAULTS)---------------
+    adamw_beta1: float = 0.8
+    adamw_beta2: float = 0.95
+    muon_beta1: float = 0.95
+    muon_beta2: float = 0.9
+    eps: float = 1e-7
+    weight_decay: float = 0.0            # applies to the Muon (matrix) group only
+    adamw_weight_decay: float = 0.0           # For AdamW (default 0)
+
+    # -------------------- Muon internals --------------------
     red_dim: int = -1
     steps: int = 5
     Nesterov: bool = True
@@ -132,26 +141,43 @@ class GPT_config:
 ###_________________________ OPTIMIZER _______________________________________
 
 class MuonAdamW:
-    """Hybrid optimizer: Muon (Newton-Schulz) for matrices + AdamW-style for the rest."""
+    """Hybrid optimizer: Muon (Newton-Schulz) for matrices + AdamW-style for the rest.,  NOTE: lr here is max_lr at the schedule """
 
-    def __init__(self, params, lr, beta2, red_dim, steps=5, beta1=0.9, Nesterov=True, eps=1e-7):
+    def __init__(self, params, adamw_lr, adamw_wd, muon_lr, muon_wd, red_dim, steps=5, adamw_beta1=0.9, adamw_beta2=0.97, muon_beta1=0.9, muon_beta2=0.97,  Nesterov=True, eps=1e-7):
         self.params = params
-        self.lr = lr
-        self.beta2 = beta2
-        self.red_dim = red_dim
-        self.steps = steps
-        self.beta1 = beta1
-        self.Nesterov = Nesterov
+        self.adamw_lr = adamw_lr
+        self.muon_lr = muon_lr
+        self.adamw_wd = adamw_wd
+        self.muon_wd = muon_wd
+        self.adamw_beta1 = adamw_beta1
+        self.adamw_beta2 = adamw_beta2
+        self.muon_beta1 = muon_beta1
+        self.muon_beta2 = muon_beta2
         self.eps = eps
+        self.red_dim = red_dim
+        self.steps = steps         # Newton_Sched steps
+        self.Nesterov = Nesterov
         self.i = 0
 
-    def step(self, lr=None):
-        if lr is None: lr = self.lr
+    def step(self, lr_mult=1.):
+        # Update params
         with torch.no_grad():
             for g in self.params:
                 use_muon = g.get('use_muon', None)
+                # Get the hyperparams in group (if None -> set default)
+                lr = g.get('lr', self.muon_lr if use_muon else self.adamw_lr) * lr_mult    # base_lr * lr_mult
+                weight_decay =  g.get('weight_decay', self.muon_wd if use_muon else self.adamw_wd)
+                beta1 = g.get('beta1', self.muon_beta1 if use_muon else self.adamw_beta1)
+                beta2 = g.get('beta2', self.muon_beta2 if use_muon else self.adamw_beta2)
+                eps   = g.get('eps', self.eps)
+                if use_muon:
+                    red_dim = g.get('red_dim', self.red_dim)
+                    Nesterov = g.get('Nesterov', self.Nesterov)
+                    steps = g.get('steps', self.steps)
+                else: red_dim, Nesterov, steps = None, None, None
+
                 for p in g['params']:
-                    self.opt_step(p, g['weight_decay'], lr, use_muon)
+                    self.opt_step(p, lr, beta1, beta2, eps, weight_decay, red_dim, Nesterov, steps, use_muon)
         self.i += 1
 
     def zero_grad(self):
@@ -159,7 +185,7 @@ class MuonAdamW:
             for p in g['params']:
                 if p.grad is not None: p.grad.data.zero_()
 
-    def opt_step(self, p, wd, lr, use_muon=None):
+    def opt_step(self, p, lr, beta1, beta2, eps, wd, red_dim, Nesterov, steps,  use_muon):
         if use_muon is None:
             use_muon = (p.dim() >= 2)   # fallback for old-style groups
 
@@ -167,11 +193,11 @@ class MuonAdamW:
         if not use_muon:
             if not hasattr(p, 'grad_avg'): p.grad_avg = torch.zeros_like(p.grad.data)
             if not hasattr(p, 'grad_sqr_avg'): p.grad_sqr_avg = torch.zeros_like(p.grad.data)
-            p.grad_avg.lerp_(p.grad, 1 - self.beta1)
-            p.grad_sqr_avg.lerp_(p.grad.square(), 1 - self.beta2)
-            unbiased_grad_avg = p.grad_avg / (1 - self.beta1 ** (self.i+1))
-            unbiased_grad_sqr_avg = p.grad_sqr_avg / (1 - self.beta2 ** (self.i+1))
-            update = unbiased_grad_avg / (unbiased_grad_sqr_avg.sqrt() + self.eps)
+            p.grad_avg.lerp_(p.grad, 1 - beta1)
+            p.grad_sqr_avg.lerp_(p.grad.square(), 1 - beta2)
+            unbiased_grad_avg = p.grad_avg / (1 - beta1 ** (self.i+1))
+            unbiased_grad_sqr_avg = p.grad_sqr_avg / (1 - beta2 ** (self.i+1))
+            update = unbiased_grad_avg / (unbiased_grad_sqr_avg.sqrt() + eps)
             if wd: update += wd * p.data
             p.data.sub_(lr * update)
 
@@ -182,21 +208,21 @@ class MuonAdamW:
 
             # Nesterov momentum
             if not hasattr(p, 'grad_avg'): p.grad_avg = torch.zeros_like(g)
-            p.grad_avg.lerp_(g, 1 - self.beta1)
-            unbiased_grad_avg = p.grad_avg / (1 - self.beta1 ** (self.i+1))
-            g = g.lerp(unbiased_grad_avg, self.beta1) if self.Nesterov else unbiased_grad_avg
+            p.grad_avg.lerp_(g, 1 - beta1)
+            unbiased_grad_avg = p.grad_avg / (1 - beta1 ** (self.i+1))
+            g = g.lerp(unbiased_grad_avg, beta1) if Nesterov else unbiased_grad_avg
 
             # Normalization using Norm
             target = g.norm(dim=(-1, -2), keepdim=True) * (g.size(-2)**-0.5)
             row_norm = g.norm(dim=(-1), keepdim=True)
-            g = g * (target / (row_norm + self.eps))
+            g = g * (target / (row_norm + eps))
 
             # Frobenius norm
-            g /= (g.norm(dim=(-1, -2), keepdim=True) * 1.01 + self.eps)  # 1.01 is just safety so that everything is <1 and <-1 and not =
+            g /= (g.norm(dim=(-1, -2), keepdim=True) * 1.01 + eps)  # 1.01 is just safety so that everything is <1 and <-1 and not =
 
             # Newton sched
             a, b, c = 3.4445, -4.7750, 2.0315
-            for _ in range(self.steps):
+            for _ in range(steps):
                 A = g @ g.mT                # mT transposes the last 2 dims
                 B = b * A + c * (A @ A)
                 g = a * g + B @ g
@@ -204,20 +230,20 @@ class MuonAdamW:
             # Muon+ normalization
             targ_norm = min(g.size(-2), g.size(-1))**0.5
             current_norm = g.norm(dim=(-1, -2), keepdim=True)
-            g = g * (targ_norm / (current_norm + self.eps))
+            g = g * (targ_norm / (current_norm + eps))
 
             # Variance Reduction
-            v_mean = g.square().mean(dim=self.red_dim, keepdim=True)
-            red_dim_sz = g.size(self.red_dim)
+            v_mean = g.square().mean(dim=red_dim, keepdim=True)
+            red_dim_sz = g.size(red_dim)
             v_norm_sq = v_mean.sum(dim=(-1, -2), keepdim=True) * red_dim_sz
             v_norm = v_norm_sq.sqrt()
             if not hasattr(p, 'v_mean_avg'): p.v_mean_avg = torch.zeros_like(v_mean)
-            p.v_mean_avg.lerp_(v_mean, 1 - self.beta2)
-            unbiased_v_mean_avg = p.v_mean_avg / (1 - self.beta2 ** (self.i+1))
-            step_sz = (unbiased_v_mean_avg + self.eps).rsqrt()
+            p.v_mean_avg.lerp_(v_mean, 1 - beta2)
+            unbiased_v_mean_avg = p.v_mean_avg / (1 - beta2 ** (self.i+1))
+            step_sz = (unbiased_v_mean_avg + eps).rsqrt()
             scaled_sq_sum = (v_mean * red_dim_sz) * step_sz.square()
             v_norm_new = scaled_sq_sum.sum(dim=(-1, -2), keepdim=True).sqrt()
-            final_scale = step_sz * (v_norm / (v_norm_new + self.eps))
+            final_scale = step_sz * (v_norm / (v_norm_new + eps))
             g = g * final_scale
 
             # Update
@@ -551,37 +577,69 @@ class GPT(nn.Module):
         return logits, loss
 
     def optimizers_config(self, device_type, optimizer=None):
-        """Build either plain AdamW or MuonAdamW param groups."""
-        params_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+        """Build either plain AdamW (single global group, fallback) or MuonAdamW
+        (one param group per role, each with its own tuned lr/betas)."""
+        named = dict(self.named_parameters())
+        cfg = self.config
+        dmodel_lr_scale = (cfg.n_embd / 768) ** -0.5
 
-        # ANY embedding table must skip Muon
-        # also exclude the 2-D per-layer scalar parameters & smear_gate so they do not receive weight-decay (AdamW path) nor Newton-Schulz orthogonalization (Muon path)
-        no_muon_names = {f"{mod_name}.weight" for mod_name, mod in self.named_modules() if isinstance(mod, nn.Embedding)}
-        no_muon_names |= {'resid_lambdas', 'x0_lambdas', 'smear_gate.weight'} # |=   is the same as   .update({set})
+        # anything that must NEVER go through Muon: embeddings, per-layer scalars, lm_head
+        embedding_names = {f"{m}.weight" for m, mod in self.named_modules() if isinstance(mod, nn.Embedding)}
+        scalar_names = {'resid_lambdas', 'x0_lambdas'}
+        if cfg.smear_gate_flag: scalar_names |= {'smear_gate.weight', 'smear_lambda'}
+        if cfg.backout_flag:    scalar_names |= {'backout_lambda'}
+        no_muon_names = embedding_names | scalar_names | {'lm_head.weight'}
 
         if optimizer is None:
-            decay_params = [p for pn, p in params_dict.items() if p.dim() >= 2 and pn not in no_muon_names]
-            no_decay_params = [p for pn, p in params_dict.items() if p.dim() < 2 or pn in no_muon_names]
-            optim_group = [
-                {'params': decay_params, 'weight_decay': self.config.weight_decay},
-                {'params': no_decay_params, 'weight_decay': 0.},
-            ]
+            decay = [p for pn, p in named.items() if p.dim() >= 2 and pn not in no_muon_names]
+            no_decay = [p for pn, p in named.items() if p.dim() < 2 or pn in no_muon_names]
             fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-            use_fuse = fused_available and device_type == 'cuda'
-            return torch.optim.AdamW(optim_group, lr=self.config.max_lr,
-                                     betas=(self.config.beta1, self.config.beta2),
-                                     eps=self.config.eps, fused=use_fuse)
-        else:
-            muon_params = [p for pn, p in params_dict.items() if p.dim() >= 2 and pn not in no_muon_names]
-            adam_params = [p for pn, p in params_dict.items() if p.dim() < 2 or pn in no_muon_names]
-            optim_group = [
-                {'params': muon_params, 'weight_decay': self.config.weight_decay, 'use_muon': True},
-                {'params': adam_params, 'weight_decay': 0., 'use_muon': False},
-            ]
-            return optimizer(optim_group, lr=self.config.max_lr, beta1=self.config.beta1,
-                             beta2=self.config.beta2, eps=self.config.eps,
-                             steps=self.config.steps, red_dim=self.config.red_dim,
-                             Nesterov=self.config.Nesterov)
+            return torch.optim.AdamW(
+                [{'params': decay, 'weight_decay': cfg.weight_decay},
+                 {'params': no_decay, 'weight_decay': 0.}],
+                lr=cfg.matrix_lr, betas=(cfg.adamw_beta1, cfg.adamw_beta2),
+                eps=cfg.eps, fused=fused_available and device_type == 'cuda')
+
+        groups, assigned = [], set()
+
+        def add_group(names, **kwargs):
+            params = [named[n] for n in names if n in named]
+            if params:
+                groups.append(dict(params=params, **kwargs))
+                assigned.update(n for n in names if n in named)
+
+        add_group({'lm_head.weight'}, lr=cfg.unembedding_lr * dmodel_lr_scale, weight_decay=0.01,
+                  beta1=0.8, beta2=0.96, eps=1e-10, use_muon=False)
+        add_group({'transformer.wte.weight'}, lr=cfg.embedding_lr * dmodel_lr_scale, weight_decay=0.001,
+                  beta1=0.8, beta2=0.995, eps=1e-10, use_muon=False)
+        add_group({'transformer.ve_te.weight'}, lr=cfg.embedding_lr * dmodel_lr_scale * 0.5, weight_decay=0.01,
+                  beta1=0.8, beta2=0.995, eps=1e-10, use_muon=False)
+        add_group({'resid_lambdas'}, lr=cfg.scalar_lr * 0.01, weight_decay=0.05,
+                  beta1=0.8, beta2=0.95, eps=1e-10, use_muon=False)
+        add_group({'x0_lambdas'}, lr=cfg.scalar_lr, weight_decay=0.0,
+                  beta1=0.96, beta2=0.95, eps=1e-10, use_muon=False)
+        add_group({'smear_gate.weight', 'smear_lambda', 'backout_lambda'}, lr=0.2, weight_decay=0.0,
+                  beta1=0.8, beta2=0.95, eps=1e-10, use_muon=False)
+
+        # catch-all: any embedding param not already placed above -- this only fires when
+        # Table_embds_per_layer=True, giving each per-layer `ve` embedding table its own
+        # AdamW-with-embedding-lr group instead of silently being left out of optimization
+        add_group(embedding_names - assigned, lr=cfg.embedding_lr * dmodel_lr_scale * 0.5, weight_decay=0.01,
+                  beta1=0.8, beta2=0.995, eps=1e-10, use_muon=False)
+
+        matrix_names = {pn for pn, p in named.items() if p.dim() >= 2 and pn not in no_muon_names}
+        add_group(matrix_names, lr=cfg.matrix_lr, weight_decay=cfg.weight_decay, use_muon=True)
+
+        # catches any parameter that silently never gets optimized
+        missing = set(named) - assigned - matrix_names
+        assert not missing, f"Parameters not assigned to any optimizer group: {missing}"
+
+        return optimizer(groups, adamw_lr=cfg.embedding_lr * dmodel_lr_scale, adamw_wd=cfg.adamw_weight_decay,
+                                 muon_lr=cfg.matrix_lr, muon_wd=cfg.weight_decay,
+                                 red_dim=cfg.red_dim, steps=cfg.steps,
+                                 adamw_beta1=cfg.adamw_beta1, adamw_beta2=cfg.adamw_beta2,
+                                 muon_beta1=cfg.muon_beta1, muon_beta2=cfg.muon_beta2,
+                                 Nesterov=cfg.Nesterov, eps=cfg.eps)
 
 
 ###______________________________________ MAKE A DATALOADER ________________________________
@@ -655,16 +713,20 @@ def get_most_likely_row(tokens, mask, logits):
 
 ###_________________________________ LR SCHED _______________________________________________
 
-# Creating a LR sched
-def get_lr(step, config):
-    min_lr = config.max_lr * config.min_lr_ratio
-    if step < config.warmup_steps: return config.max_lr/config.warmup_steps * (step+1)
-    if step > config.max_steps : return min_lr
-    decay_ratio = (step-config.warmup_steps)/(config.max_steps-config.warmup_steps) # make a ratio between 0 and 1 that represent the current section in the cos
+# ------ Ratios --------
+def get_lr_ratio(step, config):
+    if step < config.warmup_steps: return (step + 1) / config.warmup_steps
+    if step > config.max_steps: return config.min_lr_ratio
+    decay_ratio = (step - config.warmup_steps) / (config.max_steps - config.warmup_steps)
     assert 0 <= decay_ratio <= 1, f'There is something wrong with max steps:{config.max_steps}, step:{step}, warmup_steps:{config.warmup_steps}'
     coeff = 0.5 * (1 + math.cos(math.pi * decay_ratio))
-    return min_lr + coeff * (config.max_lr - min_lr)
+    return config.min_lr_ratio + coeff * (1 - config.min_lr_ratio)
 
+# ------ Get LR ---------
+def get_lr(step, config):
+    """Absolute matrix/muon lr, derived from the ratio -- kept only for the printed log line.
+    Since every group now has its own base lr, this number is representative, not literal."""
+    return config.matrix_lr * get_lr_ratio(step, config)
 
 ###_____________________________________  INSTANCES  ______________________________________
 
@@ -673,6 +735,9 @@ torch.set_float32_matmul_precision('high')
 
 # config
 config = GPT_config()
+
+# partial for ratio getter
+lr_ratio_getter = partial(get_lr_ratio, config=config)
 
 # Import flash_attn_func if going to be used
 if config.use_flash_attn_func_flag: from flash_attn import flash_attn_func
@@ -812,11 +877,12 @@ for step in range(config.training_steps):
             accum_loss += loss.detach()
         loss.backward()
     if ddp:  dist.all_reduce(accum_loss, op= dist.ReduceOp.AVG) # Averaging the Loss Across all the Processes
-    lr = lr_getter(step)
+    lr = get_lr(step, config)   # For the printing, log
+    lr_mult = lr_ratio_getter(step)
     # for param_group in optimizer.param_groups:  -----> Because we are using the MuonAdamW optimizer, we don't need to set the lr for each param group, we just pass it to the step function
     #     param_group['lr'] = lr
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.) # This Makes Normalization for the Norm of the Gradients proportionally, so that -> root(sum(grads**2)) <= 1
-    optimizer.step(lr)
+    optimizer.step(lr_mult)
     optimizer.zero_grad()
     if device_type == 'cuda' : torch.cuda.synchronize() # so that the cpu don't run the next command while the GPU still hasn't Finished
 
