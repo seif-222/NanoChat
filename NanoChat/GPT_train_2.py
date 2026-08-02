@@ -127,6 +127,7 @@ class GPT_config:
     # Backout  -> Removing the Intermediate or Middle of output of Transformer from the final layer
     backout_flag: bool = True
     backout_layer: Optional[int] = None     # the default if it was none -> n_layer//2     - NOTE: first_layer_idx = 1
+    backout_proj_flag: bool = False         # This create a linear_proj before backout_step:  x = x - self.backout_lambda * (x_backout) <-add proj to this
 
     # Logit Softcap
     logit_softcap: int = 15
@@ -212,12 +213,12 @@ class MuonAdamW:
             unbiased_grad_avg = p.grad_avg / (1 - beta1 ** (self.i+1))
             g = g.lerp(unbiased_grad_avg, beta1) if Nesterov else unbiased_grad_avg
 
-            # Normalization using Norm
+            # Row Normalization ->  To make all rows norms equal (with the same matrix norm), nudge singular numbers slightly (each row diff factor), but it is minor and the speed-up is worth it.
             target = g.norm(dim=(-1, -2), keepdim=True) * (g.size(-2)**-0.5)
             row_norm = g.norm(dim=(-1), keepdim=True)
             g = g * (target / (row_norm + eps))
 
-            # Frobenius norm
+            # Frobenius norm -> Shrink the whole matrix down so the biggest direction is safely -1 < k < 1,  Newton-Schulz's converges correctly if every direction below 1 at start — feed it something too big and it diverges instead of converging.
             g /= (g.norm(dim=(-1, -2), keepdim=True) * 1.01 + eps)  # 1.01 is just safety so that everything is <1 and <-1 and not =
 
             # Newton sched
@@ -227,12 +228,12 @@ class MuonAdamW:
                 B = b * A + c * (A @ A)
                 g = a * g + B @ g
 
-            # Muon+ normalization
+            # Muon+ normalization -> Make it same as the SVD where the norm is going to be root of smallest dim
             targ_norm = min(g.size(-2), g.size(-1))**0.5
             current_norm = g.norm(dim=(-1, -2), keepdim=True)
             g = g * (targ_norm / (current_norm + eps))
 
-            # Variance Reduction
+            # Variance Reduction -> To normalize the rows or columns using EMA as Adam, and at the end it makes the norm of the whole matrix the same as before the variance reduction (same norm that we approximated the matrix to be in Muon+ norm)
             v_mean = g.square().mean(dim=red_dim, keepdim=True)
             red_dim_sz = g.size(red_dim)
             v_norm_sq = v_mean.sum(dim=(-1, -2), keepdim=True) * red_dim_sz
@@ -291,7 +292,7 @@ class RoPE(nn.Module):
         seq_len = x.shape[-2]
         assert seq_len <= self.sequence_length, f"Input Sequence Length for RoPE: {seq_len} should be <= The initialized Sequence Length: {self.sequence_length}"
         # create angles
-        sin_angles = self.sin_angles[:,:seq_len].to(device=x.device, dtype=x.dtype)
+        sin_angles = self.sin_angles[:,:seq_len].to(device=x.device, dtype=x.dtype)   # [:,:seq_len] not [:seq_len] because we unsqueezed so, dim: (1, max_seq_len, dim)
         cos_angles = self.cos_angles[:,:seq_len].to(device=x.device, dtype=x.dtype)
         return self._rotation(x, sin_angles, cos_angles)
 
@@ -486,6 +487,7 @@ class GPT(nn.Module):
             self.backout_lambda = nn.Parameter(torch.zeros(1))
             self.backout_layer = config.n_layer // 2 if config.backout_layer is None else config.backout_layer
             assert 0 < self.backout_layer < config.n_layer, f"backout_layer: {self.backout_layer} must be between 1 and n_layer: {config.n_layer}"
+            if config.backout_proj_flag: self.backout_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
 
         # Make the Transformer
         rope = RoPE(config)    # Make the RoPE
@@ -533,6 +535,8 @@ class GPT(nn.Module):
             nn.init.zeros_(self.smear_lambda)
         if self.config.backout_flag:
             nn.init.constant_(self.backout_lambda, 0.2)
+            if self.config.backout_proj_flag:
+                nn.init.eye_(self.backout_proj.weight)
 
         n_layer = self.config.n_layer
         with torch.no_grad():
@@ -571,7 +575,9 @@ class GPT(nn.Module):
             if self.config.backout_flag:
                 if i == (self.backout_layer - 1): x_backout = x.clone()
         # Backout
-        if self.config.backout_flag: x = x - self.backout_lambda * x_backout
+        if self.config.backout_flag:
+            if self.config.backout_proj_flag: x_backout = self.backout_proj(x_backout)
+            x = x - self.backout_lambda * x_backout
 
         # Apply RMSNorm
         x = norm(x)
