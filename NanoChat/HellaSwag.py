@@ -1,3 +1,15 @@
+"""
+HellaSwag benchmark: download the dataset, render each example into
+(context + ending) token/mask tensors, and score which of the 4 candidate
+endings the model finds most likely. Fully self-contained -- doesn't
+depend on the GPT model in this project, works with any model that
+returns (B, T, vocab) logits.
+
+`get_most_likely_row` is the one used during training (see train.py);
+`evaluate` is a standalone CLI for scoring a HuggingFace GPT-2 checkpoint
+directly, run as `python hellaswag.py -m gpt2 -d cuda`.
+"""
+
 import os
 import json
 import requests
@@ -13,12 +25,13 @@ DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), "HellaSwag")
 
 
 def download_file(url, fname, chunk_size=1024):
-    resp  =  requests.get(url, stream=True)
-    total = int(resp.headers.get('content-length', 0)) #  resp.headers -> dictionary of HTTP response headers sent by the server / .get("content-length", 0) -> gets the file size in bytes from the header, returns 0 if header is missing (some servers don't send it)
+    """Stream a file to disk with a progress bar."""
+    resp = requests.get(url, stream=True)
+    total = int(resp.headers.get('content-length', 0))  # resp.headers -> dictionary of HTTP response headers sent by the server / .get("content-length", 0) -> gets the file size in bytes from the header, returns 0 if header is missing (some servers don't send it)
     with open(fname, 'wb') as f, tqdm(desc=fname, total=total, unit='iB', unit_scale=True, unit_divisor=1024,) as bar:
-        for data in resp.iter_content(chunk_size=chunk_size):  #  resp.iter_content(chunk_size=1024) -> yields raw bytes in pieces of 1024 bytes at a time
+        for data in resp.iter_content(chunk_size=chunk_size):  # resp.iter_content(chunk_size=1024) -> yields raw bytes in pieces of 1024 bytes at a time
             size = f.write(data)  # > writes those raw bytes to disk & returns the number of bytes actually written
-            bar.update(size) # update how many bytes were just written
+            bar.update(size)  # update how many bytes were just written
 
 
 hellaswags = {
@@ -32,6 +45,7 @@ enc = tiktoken.get_encoding("gpt2")
 
 
 def download(split):
+    """Download the given HellaSwag split into DATA_CACHE_DIR if not already present."""
     os.makedirs(DATA_CACHE_DIR, exist_ok=True)
     data_url = hellaswags[split]
     data_filename = os.path.join(DATA_CACHE_DIR, f"hellaswag_{split}.jsonl")
@@ -41,6 +55,9 @@ def download(split):
 
 
 def render_example(example):
+    """Turn one HellaSwag example (context + 4 candidate endings) into a
+    (4, max_len) token tensor and a matching (4, max_len) mask tensor that
+    marks only the ending positions (so loss can be computed on those only)."""
     # example is a dict from the jsonl file, looks like:
     # {
     #   "ctx": "The woman picked up the ball and",
@@ -59,8 +76,8 @@ def render_example(example):
 
     data = {
         'label': label,
-        'ctx_tokens' : None,
-        'endings_tokens' : [],
+        'ctx_tokens': None,
+        'endings_tokens': [],
     }
 
     ctx_tokens = enc.encode(ctx)
@@ -71,8 +88,6 @@ def render_example(example):
     # tok_rows  -> will hold 4 lists, each being [ctx_tokens + one_ending_tokens]
     # mask_rows -> will hold 4 lists, each being [0,0,0,...,1,1,1]
     #              zeros over the context, ones over the ending,  so we can later evaluate loss ONLY on the ending part
-
-
 
     for ending in endings:
         end_tokens = enc.encode(' ' + ending)
@@ -88,16 +103,14 @@ def render_example(example):
 
         data['endings_tokens'].append(end_tokens)       # store each ending's tokens for debugging
 
-
     max_len = max(len(row) for row in tok_rows)     # needed because the 4 endings have different numbers of tokens, and we need all rows to be the same length to form a tensor
 
-    tokens = torch.zeros((4, max_len), dtype=torch.long) # we have 4 choices in each question
+    tokens = torch.zeros((4, max_len), dtype=torch.long)  # we have 4 choices in each question
     mask = torch.zeros((4, max_len), dtype=torch.long)
 
     for i, (tok_row, mask_row) in enumerate(zip(tok_rows, mask_rows)):
-        tokens[i, :len(tok_row)] = torch.tensor(tok_row) # tokens[i, :len(tok_row)] -> selects row i, columns 0 to len(tok_row) |   = torch.tensor(tok_row) -> fills those positions with this row's token ids
-        mask[i, :len(tok_row)] = torch.tensor(mask_row)      # columns beyond len(tok_row) stay as 0 (padding from torch.zeros above)
-
+        tokens[i, :len(tok_row)] = torch.tensor(tok_row)  # tokens[i, :len(tok_row)] -> selects row i, columns 0 to len(tok_row) |   = torch.tensor(tok_row) -> fills those positions with this row's token ids
+        mask[i, :len(tok_row)] = torch.tensor(mask_row)   # columns beyond len(tok_row) stay as 0 (padding from torch.zeros above)
 
     return data, tokens, mask, label
     # data   -> debug dict
@@ -107,6 +120,7 @@ def render_example(example):
 
 
 def iterate_examples(split):
+    """Yield HellaSwag examples one at a time (downloads the split first if needed)."""
     download(split)
     with open(os.path.join(DATA_CACHE_DIR, f"hellaswag_{split}.jsonl"), "r") as f:
         for line in f:
@@ -121,8 +135,28 @@ def iterate_examples(split):
             # memory efficient for large datasets
 
 
+def get_most_likely_row(tokens, mask, logits):
+    """Given (4, T) tokens/mask and (4, T, vocab) logits for one HellaSwag question,
+    return the index (0-3) of the ending with the lowest average per-token loss."""
+    shift_logits = (logits[:, :-1, :]).contiguous()
+    shift_tokens = (tokens[..., 1:]).contiguous()
+    shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+    shift_tokens = shift_tokens.view(-1)
+    loss = F.cross_entropy(shift_logits, shift_tokens, reduction='none')
+    reshaped_loss = loss.view(tokens.size(0), -1)
+    shift_mask = mask[..., 1:].contiguous()
+    masked_shift_loss = reshaped_loss * shift_mask
+    sum_loss = torch.sum(masked_shift_loss, dim=-1)
+    avg_loss = sum_loss / shift_mask.sum(-1)
+    norm_preds = torch.argmin(avg_loss).item()
+
+    return norm_preds
+
+
 @torch.no_grad()
 def evaluate(model_type, device):
+    """Standalone CLI evaluator: scores a pretrained HuggingFace GPT-2 checkpoint
+    on the full HellaSwag val split and prints running accuracy as it goes."""
     torch.set_float32_matmul_precision('high')     # tells PyTorch to use TF32 precision on Ampere GPUs (A100, RTX 3090, etc.) | TF32 is faster than full FP32 with negligible accuracy loss | 'high' enables TF32, 'highest' forces full FP32
     model = GPT2LMHeadModel.from_pretrained(model_type)
     model.to(device)
@@ -131,42 +165,33 @@ def evaluate(model_type, device):
     num_correct = 0        # counts correct predictions using raw total loss
     num_total = 0          # counts total examples seen
 
-
     for example in iterate_examples("val"):
         # calls our generator above, gets one example dict at a time
         data, tokens, mask, label = render_example(example)
         tokens = tokens.to(device)
         mask = mask.to(device)
-        logits = model(tokens).logits # shape: (4, max_len, vocab_size)
+        logits = model(tokens).logits  # shape: (4, max_len, vocab_size)
 
-        shift_logits = (logits[:,:-1,:]).contiguous()    # .contiguous() -> ensures the tensor's memory layout is sequential after slicing some PyTorch operations require this
-                                                         #  removing the last position means we drop the prediction AFTER the sequence ends
-        shift_tokens = (tokens[..., 1:]).contiguous()    #  tokens[..., 1:] -> removes the FIRST token, keeps everything from position 1 onward ->  aligns with shift_logits so that position i's logits are compared against token i+1
-
+        shift_logits = (logits[:, :-1, :]).contiguous()   # .contiguous() -> ensures the tensor's memory layout is sequential after slicing some PyTorch operations require this
+                                                          #  removing the last position means we drop the prediction AFTER the sequence ends
+        shift_tokens = (tokens[..., 1:]).contiguous()     #  tokens[..., 1:] -> removes the FIRST token, keeps everything from position 1 onward ->  aligns with shift_logits so that position i's logits are compared against token i+1
         shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-
         shift_tokens = shift_tokens.view(-1)
 
-        loss = F.cross_entropy(shift_logits, shift_tokens, reduction='none')     # reduction='none' -> returns one loss value per position instead of averaging
+        loss = F.cross_entropy(shift_logits, shift_tokens, reduction='none')  # reduction='none' -> returns one loss value per position instead of averaging
 
         reshaped_loss = loss.view(tokens.size(0), -1)
-
-        shift_mask = mask[...,1:].contiguous()
-
+        shift_mask = mask[..., 1:].contiguous()
         masked_shift_loss = reshaped_loss * shift_mask
 
         sum_loss = torch.sum(masked_shift_loss, dim=-1)
-
         avg_loss = sum_loss / shift_mask.sum(-1)   # shift_mask.sum(dim=1) -> counts how many 1s are in each row,  i.e. how many ending tokens each candidate has, without this, longer endings would always have higher total loss
 
         preds = torch.argmin(sum_loss).item()
-
         norm_preds = torch.argmin(avg_loss).item()
 
         num_total += 1
-
         num_correct += int(preds == label)
-
         num_correct_norm += int(norm_preds == label)
 
         print(f"{num_total} acc_norm: {num_correct_norm}/{num_total}={num_correct_norm / num_total:.4f}")
@@ -183,11 +208,10 @@ def evaluate(model_type, device):
             print(f"predicted: {norm_preds}, actual: {label}")
 
 
-
 if __name__ == "__main__":
-# this block ONLY runs if you execute this file directly: python hellaswag.py
-# it does NOT run if another file imports this file as a module
-# standard Python pattern to separate "runnable script" from "importable module"
+    # this block ONLY runs if you execute this file directly: python hellaswag.py
+    # it does NOT run if another file imports this file as a module
+    # standard Python pattern to separate "runnable script" from "importable module"
 
     import argparse
     parser = argparse.ArgumentParser()
@@ -209,19 +233,3 @@ if __name__ == "__main__":
 
     evaluate(args.model_type, args.device)
     # calls the main function with the parsed arguments
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

@@ -1,42 +1,21 @@
-import os
-import math
-import time
+"""
+GPT model definition: config, RoPE, attention (GQA + sliding window + value
+residual), MLP, transformer block, and the full GPT module.
+
+This file is intentionally self-contained -- it does not know about DDP,
+data loading, or the training loop. `device`, `process_rank` and
+`num_processes` below are placeholders; the training script overwrites
+them on the instantiated config once it has actually detected the
+distributed setup (torchrun env vars, GPU availability, etc.).
+"""
+
 import inspect
-import tiktoken
-import numpy as np
-
-from torch.distributed import init_process_group, destroy_process_group
-from torch.nn.parallel import DistributedDataParallel as DDP
-from typing import Optional
-import torch.distributed as dist
-
 from dataclasses import dataclass
+from typing import Optional
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from functools import partial
-from HellaSwag import render_example, iterate_examples
-
-
-###_________________________ DISTRIBUTED TRAINING _______________________________________
-
-ddp = int(os.environ.get('RANK', -1)) != -1
-if ddp:
-    assert torch.cuda.is_available(), f'There is not cuda for the device to run ddp'
-    init_process_group(backend='nccl')
-    ddp_rank = int(os.environ['RANK'])
-    ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'cuda:{ddp_local_rank}'
-    torch.cuda.set_device(device)
-    master_process = ddp_rank == 0
-else:
-    ddp_rank = 0
-    ddp_local_rank = 0
-    ddp_world_size = 1
-    master_process = True
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f'Using device: {device}')
 
 
 ###_________________________ HYPERPARAMETERS _______________________________________
@@ -91,9 +70,11 @@ class GPT_config:
     checkpoint_after_steps: int = 50
 
     # -------------------- device / multi-GPU --------------------
-    device: str = device
-    process_rank: int = ddp_rank
-    num_processes: int = ddp_world_size
+    # placeholders -- the training script fills these in from the real DDP/device
+    # detection once it runs, so this file never has to know about torchrun/env vars
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+    process_rank: int = 0
+    num_processes: int = 1
 
     # -------------------- options / feature flags --------------------
     validation: bool = True
@@ -139,120 +120,6 @@ class GPT_config:
     use_flash_attn_func_flag: bool = False
 
 
-###_________________________ OPTIMIZER _______________________________________
-
-class MuonAdamW:
-    """Hybrid optimizer: Muon (Newton-Schulz) for matrices + AdamW-style for the rest.,  NOTE: lr here is max_lr at the schedule """
-
-    def __init__(self, params, adamw_lr, adamw_wd, muon_lr, muon_wd, red_dim, steps=5, adamw_beta1=0.9, adamw_beta2=0.97, muon_beta1=0.9, muon_beta2=0.97,  Nesterov=True, eps=1e-7):
-        self.params = params
-        self.adamw_lr = adamw_lr
-        self.muon_lr = muon_lr
-        self.adamw_wd = adamw_wd
-        self.muon_wd = muon_wd
-        self.adamw_beta1 = adamw_beta1
-        self.adamw_beta2 = adamw_beta2
-        self.muon_beta1 = muon_beta1
-        self.muon_beta2 = muon_beta2
-        self.eps = eps
-        self.red_dim = red_dim
-        self.steps = steps         # Newton_Sched steps
-        self.Nesterov = Nesterov
-        self.i = 0
-
-    def step(self, lr_mult=1.):
-        # Update params
-        with torch.no_grad():
-            for g in self.params:
-                use_muon = g.get('use_muon', None)
-                # Get the hyperparams in group (if None -> set default)
-                lr = g.get('lr', self.muon_lr if use_muon else self.adamw_lr) * lr_mult    # base_lr * lr_mult
-                weight_decay =  g.get('weight_decay', self.muon_wd if use_muon else self.adamw_wd)
-                beta1 = g.get('beta1', self.muon_beta1 if use_muon else self.adamw_beta1)
-                beta2 = g.get('beta2', self.muon_beta2 if use_muon else self.adamw_beta2)
-                eps   = g.get('eps', self.eps)
-                if use_muon:
-                    red_dim = g.get('red_dim', self.red_dim)
-                    Nesterov = g.get('Nesterov', self.Nesterov)
-                    steps = g.get('steps', self.steps)
-                else: red_dim, Nesterov, steps = None, None, None
-
-                for p in g['params']:
-                    self.opt_step(p, lr, beta1, beta2, eps, weight_decay, red_dim, Nesterov, steps, use_muon)
-        self.i += 1
-
-    def zero_grad(self):
-        for g in self.params:
-            for p in g['params']:
-                if p.grad is not None: p.grad.data.zero_()
-
-    def opt_step(self, p, lr, beta1, beta2, eps, wd, red_dim, Nesterov, steps,  use_muon):
-        if use_muon is None:
-            use_muon = (p.dim() >= 2)   # fallback for old-style groups
-
-        ### 1. -------- AdamW -----------
-        if not use_muon:
-            if not hasattr(p, 'grad_avg'): p.grad_avg = torch.zeros_like(p.grad.data)
-            if not hasattr(p, 'grad_sqr_avg'): p.grad_sqr_avg = torch.zeros_like(p.grad.data)
-            p.grad_avg.lerp_(p.grad, 1 - beta1)
-            p.grad_sqr_avg.lerp_(p.grad.square(), 1 - beta2)
-            unbiased_grad_avg = p.grad_avg / (1 - beta1 ** (self.i+1))
-            unbiased_grad_sqr_avg = p.grad_sqr_avg / (1 - beta2 ** (self.i+1))
-            update = unbiased_grad_avg / (unbiased_grad_sqr_avg.sqrt() + eps)
-            if wd: update += wd * p.data
-            p.data.sub_(lr * update)
-
-        ### 2. -------- Muon ------------
-        else:
-            # Save grad at g
-            g = p.grad.data
-
-            # Nesterov momentum
-            if not hasattr(p, 'grad_avg'): p.grad_avg = torch.zeros_like(g)
-            p.grad_avg.lerp_(g, 1 - beta1)
-            unbiased_grad_avg = p.grad_avg / (1 - beta1 ** (self.i+1))
-            g = g.lerp(unbiased_grad_avg, beta1) if Nesterov else unbiased_grad_avg
-
-            # Row Normalization ->  To make all rows norms equal (with the same matrix norm), nudge singular numbers slightly (each row diff factor), but it is minor and the speed-up is worth it.
-            target = g.norm(dim=(-1, -2), keepdim=True) * (g.size(-2)**-0.5)
-            row_norm = g.norm(dim=(-1), keepdim=True)
-            g = g * (target / (row_norm + eps))
-
-            # Frobenius norm -> Shrink the whole matrix down so the biggest direction is safely -1 < k < 1,  Newton-Schulz's converges correctly if every direction below 1 at start — feed it something too big and it diverges instead of converging.
-            g /= (g.norm(dim=(-1, -2), keepdim=True) * 1.01 + eps)  # 1.01 is just safety so that everything is <1 and <-1 and not =
-
-            # Newton sched
-            a, b, c = 3.4445, -4.7750, 2.0315
-            for _ in range(steps):
-                A = g @ g.mT                # mT transposes the last 2 dims
-                B = b * A + c * (A @ A)
-                g = a * g + B @ g
-
-            # Muon+ normalization -> Make it same as the SVD where the norm is going to be root of smallest dim
-            targ_norm = min(g.size(-2), g.size(-1))**0.5
-            current_norm = g.norm(dim=(-1, -2), keepdim=True)
-            g = g * (targ_norm / (current_norm + eps))
-
-            # Variance Reduction -> To normalize the rows or columns using EMA as Adam, and at the end it makes the norm of the whole matrix the same as before the variance reduction (same norm that we approximated the matrix to be in Muon+ norm)
-            v_mean = g.square().mean(dim=red_dim, keepdim=True)
-            red_dim_sz = g.size(red_dim)
-            v_norm_sq = v_mean.sum(dim=(-1, -2), keepdim=True) * red_dim_sz
-            v_norm = v_norm_sq.sqrt()
-            if not hasattr(p, 'v_mean_avg'): p.v_mean_avg = torch.zeros_like(v_mean)
-            p.v_mean_avg.lerp_(v_mean, 1 - beta2)
-            unbiased_v_mean_avg = p.v_mean_avg / (1 - beta2 ** (self.i+1))
-            step_sz = (unbiased_v_mean_avg + eps).rsqrt()
-            scaled_sq_sum = (v_mean * red_dim_sz) * step_sz.square()
-            v_norm_new = scaled_sq_sum.sum(dim=(-1, -2), keepdim=True).sqrt()
-            final_scale = step_sz * (v_norm / (v_norm_new + eps))
-            g = g * final_scale
-
-            # Update
-            mask = (g * unbiased_grad_avg) >= 0
-            update = g + wd * p.data * mask if wd else g
-            p.data.sub_(lr * update)  # Make it in place
-
-
 ###________________________ CREATING THE RoPE POSITIONAL ENCODING ______________________
 
 class RoPE(nn.Module):
@@ -262,22 +129,25 @@ class RoPE(nn.Module):
         super().__init__()
         inv_freq = self._create_inv_freq(config.n_embd // config.n_head, config.base)
         self.sequence_length = config.block_size
-        angles =  self._create_angles(inv_freq, self.sequence_length).unsqueeze(0)
+        angles = self._create_angles(inv_freq, self.sequence_length).unsqueeze(0)
         self.register_buffer('sin_angles', angles.sin())
         self.register_buffer('cos_angles', angles.cos())
 
     def _create_inv_freq(self, head_dim, base=10000):
+        """Geometric spread of frequencies from 1 down to ~1/base, one per rotation pair."""
         dim = head_dim // 2
         x = torch.arange(dim, dtype=torch.float32)
         inv_freq = base ** (-x / dim)
         return inv_freq
 
     def _create_angles(self, inv_freq, sequence_length=100):
+        """Outer product of positions x frequencies -> one angle per (position, freq-pair)."""
         positions = torch.arange(sequence_length, device=inv_freq.device, dtype=torch.float32)
         angles = positions[:, None] * inv_freq[None, :]
         return angles
 
     def _rotation(self, x, sin_angles, cos_angles):
+        """Rotate each (first-half, second-half) channel pair by its precomputed angle."""
         x1 = x[..., :x.shape[-1]//2]
         x2 = x[..., x.shape[-1]//2:]
 
@@ -288,12 +158,13 @@ class RoPE(nn.Module):
         return torch.cat([y1, y2], dim=-1)
 
     def forward(self, x):
+        """Apply RoPE to x, slicing the precomputed angle table to the current seq len."""
         # Get the dims & device
         seq_len = x.shape[-2]
         assert seq_len <= self.sequence_length, f"Input Sequence Length for RoPE: {seq_len} should be <= The initialized Sequence Length: {self.sequence_length}"
         # create angles
-        sin_angles = self.sin_angles[:,:seq_len].to(device=x.device, dtype=x.dtype)   # [:,:seq_len] not [:seq_len] because we unsqueezed so, dim: (1, max_seq_len, dim)
-        cos_angles = self.cos_angles[:,:seq_len].to(device=x.device, dtype=x.dtype)
+        sin_angles = self.sin_angles[:, :seq_len].to(device=x.device, dtype=x.dtype)   # [:,:seq_len] not [:seq_len] because we unsqueezed so, dim: (1, max_seq_len, dim)
+        cos_angles = self.cos_angles[:, :seq_len].to(device=x.device, dtype=x.dtype)
         return self._rotation(x, sin_angles, cos_angles)
 
 
@@ -311,10 +182,11 @@ def compute_ve_flag(layer_idx, n_layers, ve_per_n_layers):
     is_alternating = layer_idx % ve_per_n_layers == (n_layers - 1) % ve_per_n_layers
     return is_alternating or layer_idx == (n_layers - 1)  # is alternating or the last layer
 
+
 # 3. ------- Sliding Window Attention ---------
 def sliding_window_attn(q, k, v, sequence_length, group_size, window_size):
-    """ Create Sliding Window Attention where, make the mask then use F.scaled_dot_product_attention()"""
-    # Manually expand K,V from n_kv_head → n_head
+    """Create Sliding Window Attention where, make the mask then use F.scaled_dot_product_attention()"""
+    # Manually expand K,V from n_kv_head -> n_head
     k_exp = k.repeat_interleave(group_size, dim=1)  # (B, n_head, T, head_sz)
     v_exp = v.repeat_interleave(group_size, dim=1)  # (B, n_head, T, head_sz)
     # Bool mask
@@ -375,6 +247,8 @@ class CausalMultiHeadAttention(nn.Module):
             self.ve_gate = nn.Linear(self.n_embd_ve_gate, self.n_kv_head, bias=False)
 
     def forward(self, x, char, x_ve_input):  # x -> (B, T, E)     | x_ve_input -> (token_indicies: in case of there is a ve_embd_table_per_layer),
+        """Run one attention block: QKV projection, value-residual injection, RoPE, then
+        either full (char='L') or sliding-window (char='S') causal attention."""
         # shapes                                                               -> (ve_embeddings: in case of there is a Global ve_embd_table)
         b, t, c = x.shape
 
@@ -413,6 +287,7 @@ class CausalMultiHeadAttention(nn.Module):
         # Run FlashAttention (IF char == S)
         if char == 'S':
             if self.use_flash_attn_func_flag:
+                from flash_attn import flash_attn_func  # imported lazily: only required if this flag is actually turned on
                 q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)               # Because the flash_attn_func expects -> (B, T, n_head, head_sz) not (B, n_head, T, head_sz)
                 wei = flash_attn_func(q, k, v, causal=True, window_size=(self.window_size, 0))  # (left=window, right=0) -> only look back window tokens, never forward | causal=True is already what blocks future tokens but Both together are redundant but harmless.
                 wei = wei.reshape(b, t, c)
@@ -436,6 +311,7 @@ class MLP(nn.Module):
         self.c_proj.INIT_SPECIAL_STD = 1
 
     def forward(self, x):
+        """Up-project, ReLU², down-project."""
         return self.c_proj(F.relu(self.c_fc(x)).square())   # Made the Activation as the ReLU^2
 
 
@@ -450,6 +326,7 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x, char, x_ve_input=None):
+        """Pre-norm residual attention, then pre-norm residual MLP."""
         x = x + self.attn(norm(x), char, x_ve_input)
         return x + self.mlp(norm(x))
 
@@ -510,6 +387,8 @@ class GPT(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
+        """Initialize every parameter group with its own scheme (uniform for QKV/MLP-in,
+        zero for projections, high-std normal for wte, near-zero for lm_head, etc.)."""
         n_embd = self.config.n_embd
         s = 3 ** 0.5 * n_embd ** -0.5  # uniform bound giving the same std as Normal(0, n_embd^-0.5)
 
@@ -545,6 +424,9 @@ class GPT(nn.Module):
                 self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
 
     def forward(self, x, targets=None):  # x -> (B, Tokens)
+        """Full forward pass: embed -> smear -> N transformer blocks (with per-layer
+        resid/x0 scalars and optional backout) -> final norm -> lm_head -> softcap ->
+        optional loss if targets are given."""
         # Shape & Assert
         B, T = x.shape
         assert T <= self.config.block_size, f'The Context Exceeds the block size {T} > {self.config.block_size}'
@@ -658,258 +540,3 @@ class GPT(nn.Module):
                                  adamw_beta1=cfg.adamw_beta1, adamw_beta2=cfg.adamw_beta2,
                                  muon_beta1=cfg.muon_beta1, muon_beta2=cfg.muon_beta2,
                                  Nesterov=cfg.Nesterov, eps=cfg.eps)
-
-
-###______________________________________ MAKE A DATALOADER ________________________________
-
-# 1. -------- Load_Token Helper Function ---------
-def load_tokens(filename):
-    np_loaded = np.load(filename)
-    np_loaded = np_loaded.astype(np.int32) # convert uint16 to int32 before cast to long, otherwise pytorch doesn't like it
-    return torch.tensor(np_loaded, dtype=torch.long)
-
-
-# 2. --------- Make DL lite ------------
-class DL_lite:
-    def __init__(self, config, split):
-        assert split in {'Train', 'Val'}, 'Split must be one of "Train" or "Val"'
-        # store attr
-        self.block_size = config.block_size
-        self.process_rank = config.process_rank
-        self.num_processes = config.num_processes
-        self.bs = config.bs
-        assert config.tot_bs_for_grad_accum % (self.bs * self.block_size * config.num_processes) == 0, f'Total_Batch_size: {config.tot_bs_for_grad_accum} is not divisible by bs: {self.bs} * block_size: {self.block_size} * num_processes: {config.num_processes}'
-        grad_accum = bool(config.tot_bs_for_grad_accum)
-        self.tot_mini_batches = config.tot_bs_for_grad_accum // (self.bs * self.block_size * self.num_processes) if grad_accum else 1
-
-        # Loading the data
-        data_root = config.data_root
-        shards = os.listdir(data_root)
-        shards = [s for s in shards if split in s]
-        shards = sorted(shards)
-        self.shards = [os.path.join(data_root, s) for s in shards]
-        assert len(shards) > 0, f"no shards found for split {split}"
-        if master_process: print(f'Found Shards =  {len(self.shards)} | Split = {split} | Total Batch Size = {config.tot_bs_for_grad_accum} | Grad Accum = {grad_accum} | Number Mini Batches = {self.tot_mini_batches} | Num_processes: {self.num_processes}')
-
-        # Make a trackers
-        self.reset()
-
-    def reset(self):
-        self.current_shard = 0
-        self.tokens = load_tokens(self.shards[self.current_shard])
-        self.tr = self.bs * self.block_size * self.process_rank
-
-    def after_batch(self):
-        tokens = self.tokens[self.tr : self.tr + self.bs * self.block_size + 1 ]
-        self.tr += self.bs * self.block_size * self.num_processes
-        x = tokens[:-1].view(self.bs, -1)
-        y = tokens[1:].view(self.bs, -1)
-        if (self.bs * self.block_size * self.num_processes  + 1 + self.tr) > len(self.tokens):
-            self.current_shard = (self.current_shard + 1) % len(self.shards) # So that we advance to the next shard and if we finish the shards we loop again because of -> %
-            self.tokens = load_tokens(self.shards[self.current_shard])
-            self.tr = self.bs * self.block_size * self.process_rank
-        return x, y
-
-
-###_________________________________ HELLASWAG FUNCTION _______________ written in HellaSwag.py ________________________________
-
-def get_most_likely_row(tokens, mask, logits):
-    shift_logits = (logits[:, :-1, :]).contiguous()
-    shift_tokens = (tokens[..., 1:]).contiguous()
-    shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-    shift_tokens = shift_tokens.view(-1)
-    loss = F.cross_entropy(shift_logits, shift_tokens, reduction='none')
-    reshaped_loss = loss.view(tokens.size(0), -1)
-    shift_mask = mask[..., 1:].contiguous()
-    masked_shift_loss = reshaped_loss * shift_mask
-    sum_loss = torch.sum(masked_shift_loss, dim=-1)
-    avg_loss = sum_loss / shift_mask.sum(-1)
-    norm_preds = torch.argmin(avg_loss).item()
-
-    return norm_preds
-
-
-###_________________________________ LR SCHED _______________________________________________
-
-# ------ Ratios --------
-def get_lr_ratio(step, config):
-    if step < config.warmup_steps: return (step + 1) / config.warmup_steps
-    if step > config.max_steps: return config.min_lr_ratio
-    decay_ratio = (step - config.warmup_steps) / (config.max_steps - config.warmup_steps)
-    assert 0 <= decay_ratio <= 1, f'There is something wrong with max steps:{config.max_steps}, step:{step}, warmup_steps:{config.warmup_steps}'
-    coeff = 0.5 * (1 + math.cos(math.pi * decay_ratio))
-    return config.min_lr_ratio + coeff * (1 - config.min_lr_ratio)
-
-# ------ Get LR ---------
-def get_lr(step, config):
-    """Absolute matrix/muon lr, derived from the ratio -- kept only for the printed log line.
-    Since every group now has its own base lr, this number is representative, not literal."""
-    return config.matrix_lr * get_lr_ratio(step, config)
-
-###_____________________________________  INSTANCES  ______________________________________
-
-# It a PyTorch function that speeds up float32 matrix multiplications on compatible NVIDIA GPUs by trading off a small amount of numerical precision for significant performance gains.
-torch.set_float32_matmul_precision('high')
-
-# config
-config = GPT_config()
-
-# partial for ratio getter
-lr_ratio_getter = partial(get_lr_ratio, config=config)
-
-# Import flash_attn_func if going to be used
-if config.use_flash_attn_func_flag: from flash_attn import flash_attn_func
-
-# make device_type
-device_type = "cuda" if config.device.startswith("cuda") else "cpu" # just to use it at the autocast, etc... and make 'cuda:3' -> 'cuda', 'cuda' -> 'cuda' ,etc...
-
-# encoder
-enc = tiktoken.get_encoding(config.tokenizer)
-
-# model
-model = GPT(config)
-model.to(config.device)
-if config.use_compile: model = torch.compile(model) # compiles the model and makes kernel fusion for the operations
-if ddp :  model = DDP(model, device_ids=[ddp_local_rank]) # Forward pass / training step → use model (the DDP wrapper) — this is what makes multi-GPU synchronization work
-raw_model = model.module if ddp else model  # always contains the "raw" unwrapped model / -> Anything else (custom methods, saving checkpoints, accessing .config) → use raw_model — because DDP's wrapper doesn't expose your class's custom stuff directly
-
-# lr getter fn
-lr_getter = partial(get_lr, config=config)
-
-# data
-train_dl = DL_lite(config, 'Train')
-val_dl = DL_lite(config, 'Val')
-
-# optim
-optimizer = raw_model.optimizers_config(device_type, MuonAdamW)
-
-# make a logging file
-log_dir = 'log'
-os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, 'log.txt')
-with open(log_file, 'w') as f: # open for writing to clear the file
-    pass
-
-
-##_____________________________________  TRAINING  ______________________________________
-
-# Training Loop
-for step in range(config.training_steps):
-    start = time.time()
-    last_step = (step == config.training_steps - 1)
-
-    # Validation
-    if (step % config.val_after_step == 0 or last_step) and (config.validation) :
-        model.eval()
-        with torch.no_grad():
-            val_accum_loss = 0.
-            for _ in range(config.val_loss_accum_steps):
-                x, y = val_dl.after_batch()
-                x, y = x.to(config.device), y.to(config.device)
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(x, y)
-                loss /= config.val_loss_accum_steps
-                val_accum_loss += loss.detach()
-        if ddp: dist.all_reduce(val_accum_loss, op=dist.ReduceOp.AVG)
-        val_dl.reset()
-        if master_process:
-            print(f"Validation loss: {val_accum_loss.item():.4f}")
-            with open(log_file, "a") as f: f.write(f"{step} val {val_accum_loss.item():.4f}\n")
-
-            # Save checkpoints for the model
-            if (step > 0) and (step % config.checkpoint_after_steps == 0 or last_step):
-                checkpoint_path = os.path.join(log_dir, f'model_checkpoint_step_{step:05d}.pt')
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'config': raw_model.config, # that is the stored config in the model object as an attr
-                    'step': step,
-                    'val_loss': val_accum_loss.item()
-                }
-                torch.save(checkpoint, checkpoint_path)
-
-    # Model Sampling
-    if step % config.val_after_step == 0 and step > 0 and config.model_sampling and (not config.use_compile):
-        model.eval()
-        tokens = enc.encode('I am crazy man,')
-        tokens = torch.tensor(tokens, dtype=torch.long)
-        tokens = tokens.repeat(config.num_sequence, 1)
-        x_gen = tokens.to(config.device)
-
-        while x_gen.shape[1] < config.max_length:
-            with torch.no_grad():
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(x_gen)
-                logits = logits[:, -1, :]
-                probs = F.softmax(logits, dim=-1)
-                topk_probs, topk_indices = torch.topk(probs, k=50, dim=-1)  # take the highest 50 probs
-                ix = torch.multinomial(topk_probs, num_samples=1)  # take one sample
-                ids = torch.gather(topk_indices, dim=-1, index=ix)
-                x_gen = torch.cat((x_gen, ids), dim=1)
-
-        for i in range(config.num_sequence):
-            decoded = enc.decode(x_gen[i, :config.max_length].tolist())
-            print(f'Rank: {config.process_rank} | Sample{i + 1}: {decoded} ')
-
-    # HellaSwag
-    # once in a while evaluate hellaswag
-    if (step % config.val_after_step == 0 or last_step) and (not config.use_compile):
-        num_correct_norm = 0
-        num_total = 0
-        for i, example in enumerate(iterate_examples("val")):
-            # only process examples where i % ddp_world_size == ddp_rank
-            if i % ddp_world_size != ddp_rank:  continue
-            # render the example into tokens and labels
-            _, tokens, mask, label = render_example(example)
-            tokens = tokens.to(device)
-            mask = mask.to(device)
-            # get the logits
-            with torch.no_grad():
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(tokens)
-                pred_norm = get_most_likely_row(tokens, mask, logits)
-            num_total += 1
-            num_correct_norm += int(pred_norm == label)
-        # reduce the stats across all processes
-        if ddp:
-            num_total = torch.tensor(num_total, dtype=torch.long, device=device)
-            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
-            dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
-            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
-            num_total = num_total.item()
-            num_correct_norm = num_correct_norm.item()
-        acc_norm = num_correct_norm / num_total
-        if master_process:
-            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
-            with open(log_file, "a") as f:  f.write(f"{step} hella {acc_norm:.4f}\n")
-
-    # Training
-    model.train()
-    accum_loss = 0
-    for mini_step in range(train_dl.tot_mini_batches):
-        x, y = train_dl.after_batch()
-        x, y = x.to(config.device), y.to(config.device)
-        if ddp:  model.require_backward_grad_sync = (mini_step == train_dl.tot_mini_batches - 1) # So that we avoid unnecessary communication during backward () unless it is the last step
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
-            loss /= train_dl.tot_mini_batches
-            accum_loss += loss.detach()
-        loss.backward()
-    if ddp:  dist.all_reduce(accum_loss, op= dist.ReduceOp.AVG) # Averaging the Loss Across all the Processes
-    lr = get_lr(step, config)   # For the printing, log
-    lr_mult = lr_ratio_getter(step)
-    # for param_group in optimizer.param_groups:  -----> Because we are using the MuonAdamW optimizer, we don't need to set the lr for each param group, we just pass it to the step function
-    #     param_group['lr'] = lr
-    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.) # This Makes Normalization for the Norm of the Gradients proportionally, so that -> root(sum(grads**2)) <= 1
-    optimizer.step(lr_mult)
-    optimizer.zero_grad()
-    if device_type == 'cuda' : torch.cuda.synchronize() # so that the cpu don't run the next command while the GPU still hasn't Finished
-
-    # Printings
-    end = time.time()
-    time_taken = end - start
-    tokens_count = train_dl.block_size * train_dl.bs * train_dl.tot_mini_batches
-    if master_process:
-        print(f'Step: {step:5d} | Loss: {accum_loss.item():.4f} | lr = {lr:.6f} | Grad_Norm = {grad_norm:6f} | Time: {time_taken:.4f}sec | Token/sec: {(tokens_count / time_taken):.3f}')
-        with open(log_file, 'a') as f: f.write(f"{step} train {accum_loss.item():.6f}\n")
-
-if ddp: destroy_process_group() # Clean After the Multi-GPU Process
