@@ -223,7 +223,7 @@ for step in range(config.training_steps):
     lr_mult = lr_ratio_getter(step)
     # for param_group in optimizer.param_groups:  -----> Because we are using the MuonAdamW optimizer, we don't need to set the lr for each param group, we just pass it to the step function
     #     param_group['lr'] = lr
-    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)  # This Makes Normalization for the Norm of the Gradients proportionally, so that -> root(sum(grads**2)) <= 1
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.clip_grad_norm_value)  # This Makes Normalization for the Norm of the Gradients proportionally, so that -> root(sum(grads**2)) <= 1
     optimizer.step(lr_mult)
     optimizer.zero_grad()
     if device_type == 'cuda': torch.cuda.synchronize()  # so that the cpu don't run the next command while the GPU still hasn't Finished

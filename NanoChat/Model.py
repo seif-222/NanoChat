@@ -68,6 +68,7 @@ class GPT_config:
     val_after_step: int = 100
     val_loss_accum_steps: int = 5
     checkpoint_after_steps: int = 50
+    clip_grad_norm_value: float = 1.0     # clip grad_norm during training
 
     # -------------------- device / multi-GPU --------------------
     # placeholders -- the training script fills these in from the real DDP/device
