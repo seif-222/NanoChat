@@ -31,6 +31,30 @@ class MuonAdamW:
         self.Nesterov = Nesterov
         self.i = 0
 
+    def state_dict(self):
+        """Flatten each parameter's raw momentum attributes (grad_avg/grad_sqr_avg/v_mean_avg) into a picklable dict, in group/param order."""
+        state = []
+        for g in self.params:
+            for p in g['params']:
+                s = {}
+                if hasattr(p, 'grad_avg'): s['grad_avg'] = p.grad_avg
+                if hasattr(p, 'grad_sqr_avg'): s['grad_sqr_avg'] = p.grad_sqr_avg
+                if hasattr(p, 'v_mean_avg'): s['v_mean_avg'] = p.v_mean_avg
+                state.append(s)
+        return {'i': self.i, 'state': state}
+
+    def load_state_dict(self, state_dict):
+        """Restore each parameter's raw momentum attributes from state_dict(), in the same group/param order."""
+        self.i = state_dict['i']
+        idx = 0
+        for g in self.params:
+            for p in g['params']:
+                s = state_dict['state'][idx]
+                if 'grad_avg' in s: p.grad_avg = s['grad_avg']
+                if 'grad_sqr_avg' in s: p.grad_sqr_avg = s['grad_sqr_avg']
+                if 'v_mean_avg' in s: p.v_mean_avg = s['v_mean_avg']
+                idx += 1
+
     def step(self, lr_mult=1.):
         """Run one optimizer step across every param group, scaling each group's
         base lr by lr_mult (the schedule ratio for this training step)."""

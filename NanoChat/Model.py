@@ -34,7 +34,7 @@ class GPT_config:
 
     # -------------------- data --------------------
     bs: int = 8                             # per-GPU micro batch
-    tokenizer: str = 'gpt2'
+    tokenizer_dir: str = './output/tokenizer'   # directory holding rustbpe_tokenizer.pkl (RustTokenizer.from_directory)
     tot_bs_for_grad_accum: int = 131072
     data_root: str = "/kaggle/input/datasets/seif222/gpt-train-kaggle-zero-to-hero"   # <- point at your actual shards
 
@@ -69,6 +69,9 @@ class GPT_config:
     val_loss_accum_steps: int = 5
     checkpoint_after_steps: int = 50
     clip_grad_norm_value: float = 1.0     # clip grad_norm during training
+
+    # -------------------- checkpoint / resume --------------------
+    resume_from: Optional[str] = None       # path to a model_checkpoint_step_*.pt file to resume training from
 
     # -------------------- device / multi-GPU --------------------
     # placeholders -- the training script fills these in from the real DDP/device
@@ -119,6 +122,16 @@ class GPT_config:
 
     # Use Flash Attention
     use_flash_attn_func_flag: bool = False
+
+    # -------------------- Weights & Biases --------------------
+    use_wandb: bool = True
+    wandb_project: str = 'Nanochat'
+    wandb_entity: Optional[str] = 'seif-222-student'
+    wandb_run_name: Optional[str] = None    # None -> let wandb auto-generate a name
+    wandb_mode: str = 'online'              # 'online' | 'offline' | 'disabled'
+    wandb_log_samples: bool = True          # log generated text samples as a wandb.Table
+    wandb_watch_model: bool = False         # log gradient/param histograms via wandb.watch (slower, opt-in)
+    wandb_watch_model_steps: int = 100
 
 
 ###________________________ CREATING THE RoPE POSITIONAL ENCODING ______________________

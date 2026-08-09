@@ -7,6 +7,7 @@ target total token count is reached. CPU-bound work.
 """
 import os
 import multiprocessing as mp
+import threading
 import numpy as np
 from datasets import load_dataset
 from tqdm import tqdm
@@ -25,7 +26,7 @@ DS_NAME = "HuggingFaceFW/fineweb-edu"
 DS_REMOTE_NAME = "sample-10BT"
 
 # Tokenizer
-tok = RustTokenizer.from_directory('./output/tokenizer')
+tok = RustTokenizer.from_directory(os.path.join(os.path.dirname(__file__), 'output/tokenizer'))
 bos = tok.get_bos_token_id()
 # Load DS
 hf_data = load_dataset(DS_NAME, name=DS_REMOTE_NAME, split='train', streaming=True)
@@ -43,6 +44,13 @@ def write_shards(filename, token_np):
     np.save(filename, token_np)
 
 
+def backpressured(iterable, sem):
+    """Cap how many documents can be queued up ahead of the writer loop."""
+    for item in iterable:
+        sem.acquire()
+        yield item
+
+
 def main():
     """Tokenize FineWeb-Edu in parallel and write it out as fixed-size shards."""
     # nprocs
@@ -52,13 +60,15 @@ def main():
     token_count = 0
     tot_token_count = 0
     # empty array
-    all_tokens_np = np.empty((SHARD_SIZE,), dtype=np.uint16)  # allocates a 1D array of 100M uint16 slots WITHOUT initializing the values (garbage values)
+    all_tokens_np = np.empty((SHARD_SIZE,), dtype=np.uint16)     # allocates a 1D array of 100M uint16 slots WITHOUT initializing the values (garbage values)
     # progress_bar
     progress_bar = None
+    sem = threading.Semaphore(64)
 
     with mp.Pool(processes=nprocs) as pool:                      # context manager, automatically terminates and cleans up at the end -even if there was error-
 
-        for tokens in pool.imap(tokenize, hf_data, chunksize=16):
+        for tokens in pool.imap(tokenize, backpressured(hf_data, sem), chunksize=16):
+            sem.release()
             # break if reached target token count
             if tot_token_count >= TARGET_TOKENS: break
 
