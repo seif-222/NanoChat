@@ -20,7 +20,8 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
-from Model import GPT_config, GPT
+from Config import GPT_config
+from Model import  GPT
 from optimizer import MuonAdamW
 from DataLoader import CustomDataLoader
 from Tokenizer import RustTokenizer
@@ -260,17 +261,18 @@ for step in range(start_step, config.training_steps):
     if (step % config.val_after_step == 0 or last_step) and (config.validation):
         val_accum_loss = validate(model, val_dl, config.device, device_type, config.val_loss_accum_steps,
                                   ddp, master_process, step, log_file)
+        # W&B
+        if master_process and config.use_wandb:  wandb.log({'val/loss': val_accum_loss.item()}, step=step)
 
         # Save checkpoints for the model
-        if (step > 0) and (step % config.checkpoint_after_steps == 0 or last_step):
+        if master_process and (step > 0) and (step % config.checkpoint_after_steps == 0 or last_step):
             save_checkpoint(log_dir, step,
                             model=raw_model.state_dict(),
                             optimizer=optimizer.state_dict(),
                             train_dl=train_dl.state_dict(),
                             config=raw_model.config,     # that is the stored config in the model object as an attr
                             val_loss=val_accum_loss.item())
-        # W&B
-        if master_process and config.use_wandb:  wandb.log({'val_loss': val_accum_loss.item()}, step=step)
+
 
 
     # 2. ---- Model Sampling ----
@@ -289,7 +291,7 @@ for step in range(start_step, config.training_steps):
                                          master_process, step, log_file)
         # W&B
         if master_process and config.use_wandb:
-            wandb.log({'eval_hellaswag_acc': acc_norm}, step=step)
+            wandb.log({'eval/hellaswag_acc': acc_norm}, step=step)
 
     # 4. ---- Training ----
     accum_loss, lr_mult, grad_norm = train_model(model, train_dl, step, config.device, device_type,
@@ -306,9 +308,9 @@ for step in range(start_step, config.training_steps):
         with open(log_file, 'a') as f: f.write(f"{step} train {accum_loss.item():.6f}\n")
         # W&B
         if config.use_wandb:
-            wandb.log({'train_loss': accum_loss.item(),     'train_lr': lr, 'train_lr_mult': lr_mult,
-                       'train_grad_norm': grad_norm.item(), 'train_tokens_per_sec': tokens_count / time_taken,
-                       'train_step_time_sec': time_taken,   'train_epoch': train_dl.epoch}, step=step)
+            wandb.log({'train/loss': accum_loss.item(),     'train/lr': lr, 'train/lr_mult': lr_mult,
+                       'train/grad_norm': grad_norm.item(), 'train/tokens_per_sec': tokens_count / time_taken,
+                       'train/step_time_sec': time_taken,   'train/epoch': train_dl.epoch}, step=step)
 
 
 if master_process and config.use_wandb: wandb.finish()
