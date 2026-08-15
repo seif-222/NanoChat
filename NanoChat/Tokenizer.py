@@ -8,7 +8,6 @@ rendering, and simple save/load to a single pickle file.
 import os
 from functools import lru_cache
 import pickle
-import rustbpe
 import tiktoken
 
 # special tokens
@@ -34,6 +33,7 @@ class RustTokenizer:
     @classmethod
     def train_from_iterator(cls, txt_iterator, n_vocab):
         """Train a new vocab from a text iterator and wrap it in a tiktoken Encoding."""
+        import rustbpe
         # RustBPE tokenizer
         tokenizer = rustbpe.Tokenizer()
         # len & assert

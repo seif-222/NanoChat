@@ -80,16 +80,11 @@ def compute_ve_flag(layer_idx, n_layers, ve_per_n_layers):
 
 
 # 3. ------- Sliding Window Attention ---------
-def sliding_window_attn(q, k, v, sequence_length, group_size, window_size):
+def sliding_window_attn(q, k, v, group_size, window_mask):
     """Create Sliding Window Attention where, make the mask then use F.scaled_dot_product_attention()"""
     # Manually expand K,V from n_kv_head -> n_head
     k_exp = k.repeat_interleave(group_size, dim=1)  # (B, n_head, T, head_sz)
     v_exp = v.repeat_interleave(group_size, dim=1)  # (B, n_head, T, head_sz)
-    # Bool mask
-    rows = torch.arange(sequence_length, device=q.device).unsqueeze(1)  # (T, 1)
-    cols = torch.arange(sequence_length, device=q.device).unsqueeze(0)  # (1, T)
-    # Create Mask
-    window_mask = (cols <= rows) & ((rows - cols) <= window_size)  # (T, T) bool
 
     wei = F.scaled_dot_product_attention(q, k_exp, v_exp, attn_mask=window_mask)
     return wei
@@ -122,6 +117,12 @@ class CausalMultiHeadAttention(nn.Module):
         assert self.window_size <= config.block_size, f'Window size: {self.window_size} should be <= block_size: {config.block_size}'
         assert config.ve_per_n_layers <= config.n_layer, f"ve_per_n_layers: {config.ve_per_n_layers} can't be > {config.n_layer}"
         if not config.Table_embds_per_layer: assert self.n_embd_ve_gate <= self.n_embd, f'Number of Embeddings in ve_Gate Residual: {self.n_embd_ve_gate}  should be <= Number of Embeddings: {self.n_embd}'
+
+        # Precomputed sliding-window mask, sliced to T at forward time
+        rows = torch.arange(config.block_size).unsqueeze(1)
+        cols = torch.arange(config.block_size).unsqueeze(0)
+        window_mask = (cols <= rows) & ((rows - cols) <= self.window_size)
+        self.register_buffer('window_mask', window_mask)
 
         # Group and Head size
         self.head_sz = self.n_embd // self.n_head
@@ -188,7 +189,7 @@ class CausalMultiHeadAttention(nn.Module):
                 wei = flash_attn_func(q, k, v, causal=True, window_size=(self.window_size, 0))  # (left=window, right=0) -> only look back window tokens, never forward | causal=True is already what blocks future tokens but Both together are redundant but harmless.
                 wei = wei.reshape(b, t, c)
             else:
-                wei = sliding_window_attn(q, k, v, t, self.group_sz, self.window_size)
+                wei = sliding_window_attn(q, k, v, self.group_sz, self.window_mask[:t, :t])
                 wei = wei.transpose(1, 2).reshape(b, t, c)                                       # Combine the heads back
 
         # return the projection

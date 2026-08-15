@@ -5,6 +5,8 @@ DDP rank reads a different slice), wrapping back to shard 0 once exhausted.
 """
 
 import os
+import threading
+import queue
 import numpy as np
 import torch
 
@@ -75,3 +77,29 @@ class CustomDataLoader:
             self.tokens = load_tokens(self.shards[self.current_shard])
             self.token_count = self.bs * self.block_size * self.process_rank
         return x, y
+
+
+# 3. --------- Prefetching Wrapper ------------
+class PrefetchLoader:
+    """Wraps a CustomDataLoader, prefetching/pinning the next batch on a background thread. Proxies other attrs through to the wrapped loader."""
+
+    def __init__(self, dataloader, device, num_prefetch=2):
+        self.dl = dataloader
+        self.device = device
+        self.q = queue.Queue(maxsize=num_prefetch)
+        self.stop_flag = False
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
+    def _worker(self):
+        while not self.stop_flag:
+            x, y = self.dl.get_batch()
+            x, y = x.pin_memory(), y.pin_memory()
+            self.q.put((x, y))
+
+    def get_batch(self):
+        x, y = self.q.get()
+        return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+
+    def __getattr__(self, name):
+        return getattr(self.dl, name)

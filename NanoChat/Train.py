@@ -23,7 +23,7 @@ import torch.distributed as dist
 from Config import GPT_config
 from Model import  GPT
 from optimizer import MuonAdamW
-from DataLoader import CustomDataLoader
+from DataLoader import CustomDataLoader, PrefetchLoader
 from Tokenizer import RustTokenizer
 from HellaSwag import render_example, iterate_examples, get_most_likely_row
 
@@ -74,6 +74,7 @@ def get_lr(step, config):
 
 # 1. ------ Config & Device -----------
 config = GPT_config()
+assert config.training_steps >= config.max_steps, f'training_steps: {config.training_steps} must be >= max_steps: {config.max_steps}'
 config.device = device                                                 # gpt.py ships generic placeholders for these three fields since it doesn't know, about DDP -- fill them in now with what we actually detected above
 config.process_rank = ddp_rank
 config.num_processes = ddp_world_size
@@ -108,7 +109,7 @@ val_dl = CustomDataLoader(config, 'Val')
 
 
 # 8. ------ Create Logging File / Resume ---------
-log_dir = 'log'
+log_dir = os.environ.get('LOG_DIR', 'log')
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, 'log.txt')
 
@@ -124,6 +125,7 @@ else:
     with open(log_file, 'w') as f:              # open for writing to clear the file
         pass
 
+train_dl = PrefetchLoader(train_dl, config.device)
 
 # 9. ------ Weights & Biases ---------
 if config.use_wandb and master_process:
@@ -261,19 +263,18 @@ for step in range(start_step, config.training_steps):
     if (step % config.val_after_step == 0 or last_step) and (config.validation):
         val_accum_loss = validate(model, val_dl, config.device, device_type, config.val_loss_accum_steps,
                                   ddp, master_process, step, log_file)
+
         # W&B
         if master_process and config.use_wandb:  wandb.log({'val/loss': val_accum_loss.item()}, step=step)
 
-        # Save checkpoints for the model
-        if master_process and (step > 0) and (step % config.checkpoint_after_steps == 0 or last_step):
-            save_checkpoint(log_dir, step,
-                            model=raw_model.state_dict(),
-                            optimizer=optimizer.state_dict(),
-                            train_dl=train_dl.state_dict(),
-                            config=raw_model.config,     # that is the stored config in the model object as an attr
-                            val_loss=val_accum_loss.item())
-
-
+    # Save checkpoints for the model
+    if master_process and (step > 0) and (step % config.checkpoint_after_steps == 0 or last_step):
+        save_checkpoint(log_dir, step,
+                        model=raw_model.state_dict(),
+                        optimizer=optimizer.state_dict(),
+                        train_dl=train_dl.state_dict(),
+                        config=raw_model.config,     # that is the stored config in the model object as an attr
+                        val_loss=(val_accum_loss.item() if val_accum_loss is not None else None))
 
     # 2. ---- Model Sampling ----
     if step % config.val_after_step == 0 and step > 0 and config.model_sampling and (not config.use_compile):
