@@ -10,6 +10,8 @@ Run with:  python train.py                                  (single GPU/CPU)
 import os
 import math
 import time
+import glob
+
 from dataclasses import asdict
 from functools import partial
 
@@ -25,7 +27,7 @@ from Model import  GPT
 from optimizer import MuonAdamW
 from DataLoader import CustomDataLoader, PrefetchLoader
 from Tokenizer import RustTokenizer
-from HellaSwag import render_example, iterate_examples, get_most_likely_row
+from HellaSwag import iterate_examples, render_examples_batch, get_most_likely_rows_batch
 
 
 ###_________________________ DISTRIBUTED TRAINING _______________________________________
@@ -113,17 +115,41 @@ log_dir = os.environ.get('LOG_DIR', 'log')
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, 'log.txt')
 
+# Helper_fn
+def try_resume(path):
+    """Try loading a full checkpoint. Returns start_step on success, None if it fails (so we can try an older one)."""
+    try:
+        ckpt = torch.load(path, map_location=config.device)
+        raw_model.load_state_dict(ckpt['model'])
+        optimizer.load_state_dict(ckpt['optimizer'])
+        train_dl.load_state_dict(ckpt['train_dl'])
+        return ckpt['step'] + 1
+    except Exception as e:
+        if master_process: print(f"Skipping unloadable checkpoint {path}: {e}")
+        return None
+
+# Variables
 start_step = 0
-if config.resume_from is not None:
-    ckpt = torch.load(config.resume_from, map_location=config.device)
-    raw_model.load_state_dict(ckpt['model'])
-    optimizer.load_state_dict(ckpt['optimizer'])
-    train_dl.load_state_dict(ckpt['train_dl'])
-    start_step = ckpt['step'] + 1
-    if master_process: print(f"Resumed from {config.resume_from} at step {start_step}")
+resumed = False
+resume_path = config.resume_from
+
+# If / Else
+if resume_path is not None:
+    start_step = try_resume(resume_path)
+    assert start_step is not None, f"Explicit resume_from={resume_path} failed to load"
+    resumed = True
+else:     # Self-heal: try newest → oldest checkpoints until one loads (handles preemption / bad leftovers)
+    for candidate in sorted(glob.glob(os.path.join(log_dir, 'model_checkpoint_step_*.pt')), reverse=True):
+        result = try_resume(candidate)
+        if result is not None:
+            start_step, resume_path, resumed = result, candidate, True
+            break
+
+# If / Else
+if resumed:
+    if master_process: print(f"Resumed from {resume_path} at step {start_step}")
 else:
-    with open(log_file, 'w') as f:              # open for writing to clear the file
-        pass
+    with open(log_file, 'w') as f:  pass
 
 train_dl = PrefetchLoader(train_dl, config.device)
 
@@ -131,7 +157,8 @@ train_dl = PrefetchLoader(train_dl, config.device)
 if config.use_wandb and master_process:
     import wandb
     wandb.init(project=config.wandb_project, entity=config.wandb_entity,
-               name=config.wandb_run_name, mode=config.wandb_mode, config=asdict(config))
+               name=config.wandb_run_name, mode=config.wandb_mode, config=asdict(config),
+               id=config.wandb_run_id, resume="allow")
     if config.wandb_watch_model: wandb.watch(raw_model, log='gradients', log_freq=config.wandb_watch_model_steps)
 
 
@@ -195,24 +222,35 @@ def sample(model, enc, num_sequence, max_length, device, device_type, process_ra
 
 
 # 4. ------- Hellaswag Validation ---------
-def validation_hellaswag(model, enc, device, device_type, ddp, ddp_world_size, ddp_rank, master_process, step, log_file):
-    """Score the model on HellaSwag val, DDP-reduce the counts, print/log and return accuracy."""
+def validation_hellaswag(model, enc, device, device_type, ddp, ddp_world_size, ddp_rank, master_process, step, log_file, max_examples=None, batch_size=32):
+    """Score the model on HellaSwag val, DDP-reduce the counts, print/log and return accuracy.
+    Examples are grouped into `batch_size`-sized forward passes instead of one forward pass
+    (+ one host-device sync) per example -- that per-example sync was the actual bottleneck,
+    since it serializes GPU work behind Python on a networked GPU."""
+    # first collect this rank's share of examples (cheap: max_examples is small, plain python objects)
+    rank_examples = []
+    for i, example in enumerate(iterate_examples("val")):
+        if max_examples is not None and i >= max_examples: break
+        # only keep examples where i % ddp_world_size == ddp_rank
+        if i % ddp_world_size == ddp_rank: rank_examples.append(example)
+
     num_correct_norm = 0
     num_total = 0
-    for i, example in enumerate(iterate_examples("val")):
-        # only process examples where i % ddp_world_size == ddp_rank
-        if i % ddp_world_size != ddp_rank: continue
-        # render the example into tokens and labels
-        _, tokens, mask, label = render_example(example, enc)
+    for start in range(0, len(rank_examples), batch_size):
+        batch = rank_examples[start: start + batch_size]
+        tokens, mask, labels = render_examples_batch(batch, enc)
         tokens = tokens.to(device)
         mask = mask.to(device)
-        # get the logits
+        # get the logits for the whole batch in one forward pass
         with torch.no_grad():
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                 logits, loss = model(tokens)
-            pred_norm = get_most_likely_row(tokens, mask, logits)
-        num_total += 1
-        num_correct_norm += int(pred_norm == label)
+            preds = get_most_likely_rows_batch(tokens, mask, logits, len(batch))
+        labels_t = torch.tensor([ex['label'] for ex in batch], device=preds.device)
+        num_total += len(batch)
+        num_correct_norm += (preds == labels_t).sum().item()   # one sync per batch, not one per example
+        if master_process and (start // batch_size) % 5 == 0:  # light progress ping so this never looks hung again
+            print(f"  hellaswag: {num_total}/{len(rank_examples)} scored so far...")
     # reduce the stats across all processes
     if ddp:
         num_total = torch.tensor(num_total, dtype=torch.long, device=device)
@@ -289,7 +327,8 @@ for step in range(start_step, config.training_steps):
     # once in a while evaluate hellaswag
     if (step % config.val_after_step == 0 or last_step) and (not config.use_compile):
         acc_norm = validation_hellaswag(model, enc, config.device, device_type, ddp, ddp_world_size, ddp_rank,
-                                         master_process, step, log_file)
+                                         master_process, step, log_file, max_examples=config.hellaswag_max_examples,
+                                         batch_size=config.hellaswag_eval_batch_size)
         # W&B
         if master_process and config.use_wandb:
             wandb.log({'eval/hellaswag_acc': acc_norm}, step=step)

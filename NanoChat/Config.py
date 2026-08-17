@@ -11,9 +11,9 @@ class GPT_config:
     """All hyperparameters and flags for the model, data, optimizer and training."""
 
     # -------------------- model architecture --------------------
-    n_embd: int = 1152
-    n_head: int = 9
-    n_layer: int = 18
+    n_embd: int = 896
+    n_head: int = 7
+    n_layer: int = 14
     vocab_size: int = 50304                 # Just a number that is divisible by 2 more times than the standard 50257
     block_size: int = 1024
     mpl_expantion_term: int = 4             # That is at the MLP linear layers   layer1 : (n_embd -> mpl_expantion_term * n_embd), ....
@@ -27,7 +27,7 @@ class GPT_config:
     # -------------------- optimizer schedule (shape only, independent of absolute lr) --------------------
     min_lr_ratio: float = 0.1
     warmup_steps: int = 150
-    max_steps: int = 6000
+    max_steps: int = 2200
 
     # -------------------- optimizer: per-group base learning rates --------------------
     matrix_lr: float = 0.02              # Muon lr for all transformer-block matrices (q/k/v/proj/mlp/ve/ve_gate)
@@ -50,10 +50,12 @@ class GPT_config:
     Nesterov: bool = True
 
     # -------------------- training & validation --------------------
-    training_steps: int = 6000              # = max_steps
-    val_after_step: int = 250
+    training_steps: int = 2200
+    val_after_step: int = 500
     val_loss_accum_steps: int = 5
-    checkpoint_after_steps: int = 250
+    hellaswag_max_examples: Optional[int] = 1000
+    hellaswag_eval_batch_size: int = 32     # examples per forward pass during hellaswag eval (=4x rows/pass); higher = fewer host-device syncs
+    checkpoint_after_steps: int = 200
     clip_grad_norm_value: float = 1.0     # clip grad_norm during training
 
     # -------------------- checkpoint / resume --------------------
@@ -77,7 +79,7 @@ class GPT_config:
     base: int = 100000
 
     # GQA
-    n_kv_head: int = 3
+    n_kv_head: int = 7
 
     # Sliding window
     mask_pattern: str = 'SSSL'
@@ -114,6 +116,7 @@ class GPT_config:
     wandb_project: str = 'Nanochat'
     wandb_entity: Optional[str] = 'seif-222-student'
     wandb_run_name: Optional[str] = None    # None -> let wandb auto-generate a name
+    wandb_run_id: Optional[str] = None
     wandb_mode: str = 'online'              # 'online' | 'offline' | 'disabled'
     wandb_log_samples: bool = True          # log generated text samples as a wandb.Table
     wandb_watch_model: bool = False         # log gradient/param histograms via wandb.watch (slower, opt-in)

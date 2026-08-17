@@ -76,7 +76,7 @@ def train_model_remote():
         subprocess.run(
             ["python", "Train.py"],
             cwd="/root/nanochat",
-            env={**os.environ, "LOG_DIR": f"{MOUNT_PATH}/checkpoints"},
+            env={**os.environ, "LOG_DIR": f"{MOUNT_PATH}/checkpoints", "PYTHONUNBUFFERED": "1"},
             check=True,
         )
     finally:
@@ -99,21 +99,41 @@ def train_model_ddp_remote(nproc: int = 2):
         subprocess.run(
             ["torchrun", "--standalone", f"--nproc_per_node={nproc}", "Train.py"],
             cwd="/root/nanochat",
-            env={**os.environ, "LOG_DIR": f"{MOUNT_PATH}/checkpoints"},
+            env={**os.environ, "LOG_DIR": f"{MOUNT_PATH}/checkpoints", "PYTHONUNBUFFERED": "1"},
             check=True,
         )
     finally:
         volume.commit()
 
 
+@app.function(
+    image=image,
+    volumes=VOLUMES,
+    gpu="A100-80GB",
+    cpu=(4, 8),
+    memory=(16384, 32768),
+    timeout=60 * 60,
+)
+def final_eval_remote(checkpoint: str):
+    """Runs the full (untrimmed) HellaSwag eval against a finished checkpoint."""
+    import subprocess
+    subprocess.run(
+        ["python", "HellaSwag.py", "-c", f"{MOUNT_PATH}/checkpoints/{checkpoint}", "-t", f"{MOUNT_PATH}/tokenizer"],
+        cwd="/root/nanochat",
+        check=True,
+    )
+
+
 @app.local_entrypoint()
-def main(stage: str = "data", nproc: int = 2):
-    """Local CLI entrypoint: dispatches to the data-download or training function based on --stage."""
+def main(stage: str = "data", nproc: int = 2, checkpoint: str = ""):
+    """Local CLI entrypoint: dispatches to the data-download, training, or final-eval function based on --stage."""
     if stage == "data":
         download_data_remote.remote()
     elif stage == "train":
         train_model_remote.remote()
     elif stage == "train_ddp":
         train_model_ddp_remote.remote(nproc=nproc)
+    elif stage == "final_eval":
+        final_eval_remote.remote(checkpoint=checkpoint)
     else:
         print(f"Unknown stage: {stage}")

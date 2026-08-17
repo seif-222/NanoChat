@@ -88,12 +88,54 @@ def render_example(example, enc):
 
     for i, (tok_row, mask_row) in enumerate(zip(tok_rows, mask_rows)):
         tokens[i, :len(tok_row)] = torch.tensor(tok_row)  # tokens[i, :len(tok_row)] -> selects row i, columns 0 to len(tok_row) |   = torch.tensor(tok_row) -> fills those positions with this row's token ids
-        mask[i, :len(tok_row)]   = torch.tensor(mask_row) # columns beyond len(tok_row) stay as 0 (padding from torch.zeros above)
+        mask[i, :len(mask_row)]   = torch.tensor(mask_row) # columns beyond len(tok_row) stay as 0 (padding from torch.zeros above)
 
     return data, tokens, mask, label                      # data   -> debug dict
                                                           # tokens -> (4, max_len) tensor of token ids, one row per candidate ending
                                                           # mask   -> (4, max_len) tensor of 0s and 1s marking ending positions
                                                           # label  -> integer 0-3, which row is the correct ending
+
+
+def render_examples_batch(examples, enc):
+    """Same idea as render_example, but for a *list* of examples at once: all of their
+    (ctx + ending) rows get packed into one padded (4*len(examples), max_len) tensor pair,
+    so a whole group of examples can be scored in a single forward pass instead of one
+    forward pass per example."""
+    tok_rows, mask_rows, labels = [], [], []
+
+    for example in examples:
+        ctx_tokens = enc.encode(example["ctx"])
+        for ending in example["endings"]:
+            end_tokens = enc.encode(' ' + ending)
+            tok_rows.append(ctx_tokens + end_tokens)
+            mask_rows.append(len(ctx_tokens) * [0] + len(end_tokens) * [1])
+        labels.append(example["label"])
+
+    max_len = max(len(row) for row in tok_rows)              # padding target is now the max over the WHOLE group, not just one example
+    tokens = torch.zeros((len(tok_rows), max_len), dtype=torch.long)
+    mask = torch.zeros((len(tok_rows), max_len), dtype=torch.long)
+
+    for i, (tok_row, mask_row) in enumerate(zip(tok_rows, mask_rows)):
+        tokens[i, :len(tok_row)] = torch.tensor(tok_row)
+        mask[i, :len(mask_row)] = torch.tensor(mask_row)
+
+    return tokens, mask, labels        # tokens/mask -> (4*len(examples), max_len) | labels -> list of len(examples) ints, in example order
+
+
+def get_most_likely_rows_batch(tokens, mask, logits, num_examples):
+    """Batched version of get_most_likely_row: scores all 4*num_examples rows in one shot,
+    then reshapes to (num_examples, 4) and returns the argmin candidate index per example."""
+    shift_logits = (logits[:, :-1, :]).contiguous()
+    shift_tokens = (tokens[..., 1:]).contiguous()
+    shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+    shift_tokens = shift_tokens.view(-1)
+    loss = F.cross_entropy(shift_logits, shift_tokens, reduction='none')
+    reshaped_loss = loss.view(tokens.size(0), -1)
+    shift_mask = mask[..., 1:].contiguous()
+    masked_shift_loss = reshaped_loss * shift_mask
+    avg_loss = masked_shift_loss.sum(-1) / shift_mask.sum(-1)   # -> (4*num_examples,)
+    avg_loss = avg_loss.view(num_examples, 4)                    # -> (num_examples, 4), row order matches render_examples_batch
+    return torch.argmin(avg_loss, dim=1)                         # -> (num_examples,) predicted candidate per example, still on-device
 
 
 def iterate_examples(split):
@@ -123,54 +165,38 @@ def get_most_likely_row(tokens, mask, logits):
 
 
 @torch.no_grad()
-def evaluate(model, enc, device=None):
-    """Score `model` on the full HellaSwag val split and print running accuracy."""
+def evaluate(model, enc, device=None, device_type=None, batch_size=32):
+    """Score `model` on the full HellaSwag val split and print running accuracy.
+    Batched (batch_size examples -> one forward pass) instead of one forward pass per
+    example -- the unbatched version paid a host-device sync on every single example,
+    which is what made this loop so slow."""
     device = device if device is not None else pick_device()
+    device_type = device_type if device_type is not None else ('cuda' if device.startswith('cuda') else 'cpu')
     model.to(device)
     torch.set_float32_matmul_precision('high')     # tells PyTorch to use TF32 precision on Ampere GPUs (A100, RTX 3090, etc.) | TF32 is faster than full FP32 with negligible accuracy loss | 'high' enables TF32, 'highest' forces full FP32
     num_correct_norm = 0                           # counts correct predictions using length-normalized loss
-    num_correct = 0                                # counts correct predictions using raw total loss
     num_total = 0                                  # counts total examples seen
+    buffer = []                                    # examples waiting to be batched together
+
+    def score_buffer():
+        """Run one forward pass over everything currently sitting in `buffer`, update the
+        running totals, then clear it."""
+        nonlocal num_correct_norm, num_total
+        tokens, mask, labels = render_examples_batch(buffer, enc)
+        tokens, mask = tokens.to(device), mask.to(device)
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):   # was missing before -- ran this whole eval in full fp32
+            logits, _ = model(tokens)
+        preds = get_most_likely_rows_batch(tokens, mask, logits, len(buffer))
+        labels_t = torch.tensor(labels, device=preds.device)
+        num_correct_norm += (preds == labels_t).sum().item()   # one sync for the whole batch, not one per example
+        num_total += len(buffer)
+        print(f"{num_total} acc_norm: {num_correct_norm}/{num_total}={num_correct_norm / num_total:.4f}")
+        buffer.clear()
 
     for example in iterate_examples("val"):
-        data, tokens, mask, label = render_example(example, enc)
-        tokens = tokens.to(device)
-        mask   = mask.to(device)
-        logits, _ = model(tokens)  # shape: (4, max_len, vocab_size)
-
-        shift_logits = (logits[:, :-1, :]).contiguous()   #  removing the last position means we drop the prediction AFTER the sequence ends
-        shift_tokens = (tokens[..., 1:]).contiguous()     #  tokens[..., 1:] -> removes the FIRST token, keeps everything from position 1 onward ->  aligns with shift_logits so that position i's logits are compared against token i+1
-        shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-        shift_tokens = shift_tokens.view(-1)
-
-        loss = F.cross_entropy(shift_logits, shift_tokens, reduction='none')  # reduction='none' -> returns one loss value per position instead of averaging
-
-        reshaped_loss = loss.view(tokens.size(0), -1)
-        shift_mask = mask[..., 1:].contiguous()
-        masked_shift_loss = reshaped_loss * shift_mask
-
-        sum_loss = torch.sum(masked_shift_loss, dim=-1)
-        avg_loss = sum_loss / shift_mask.sum(-1)   # shift_mask.sum(dim=1) -> counts how many 1s are in each row,  i.e. how many ending tokens each candidate has, without this, longer endings would always have higher total loss
-
-        preds = torch.argmin(sum_loss).item()
-        norm_preds = torch.argmin(avg_loss).item()
-
-        num_total += 1
-        num_correct += int(preds == label)
-        num_correct_norm += int(norm_preds == label)
-
-        print(f"{num_total} acc_norm: {num_correct_norm}/{num_total}={num_correct_norm / num_total:.4f}")
-
-        if num_total < 10:
-            # only prints detailed debug info for the first 9 examples
-            print(f"Context:\n {example['ctx']}")
-            print(f"Endings:")
-            # \n inside the string is a newline character
-            for i, end in enumerate(example["endings"]):
-                print(f"{i} (loss: {avg_loss[i].item():.4f}) {end}")
-                # avg_loss[i] -> indexes into the 4-element tensor to get loss for ending i
-                # .item() -> converts tensor element to plain Python float
-            print(f"predicted: {norm_preds}, actual: {label}")
+        buffer.append(example)
+        if len(buffer) == batch_size: score_buffer()
+    if buffer: score_buffer()   # score the leftover partial batch (fewer than batch_size examples)
 
     return num_correct_norm / num_total
 
