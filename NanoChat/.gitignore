@@ -1,14 +1,14 @@
 # Notebooks — scratch/prototype, superseded by the .py files
 *.ipynb
+NoteBooks/
 
 # Markdown docs — local context, not code
 *.md
+MarkDowns/
 
 # Python cache
 __pycache__/
 
-# Reasoning log — personal
-reasoning/
 
 # Large artifacts — live on disk only, never in git
 # (output/tokenizer/ stays tracked — needed for eval/inference)
