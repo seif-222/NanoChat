@@ -1,0 +1,19 @@
+# Notebooks — scratch/prototype, superseded by the .py files
+*.ipynb
+
+# Markdown docs — local context, not code
+*.md
+
+# Python cache
+__pycache__/
+
+# Reasoning log — personal
+reasoning/
+
+# Large artifacts — live on disk only, never in git
+# (output/tokenizer/ stays tracked — needed for eval/inference)
+output/data/
+output/Models/
+
+# Downloaded benchmark data
+HellaSwag/
