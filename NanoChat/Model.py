@@ -53,14 +53,14 @@ class RoPE(nn.Module):
 
         return torch.cat([y1, y2], dim=-1)
 
-    def forward(self, x):
+    def forward(self, x, start_seq=0):
         """Apply RoPE to x, slicing the precomputed angle table to the current seq len."""
         # Get the dims & device
         seq_len = x.shape[-2]
-        assert seq_len <= self.sequence_length, f"Input Sequence Length for RoPE: {seq_len} should be <= The initialized Sequence Length: {self.sequence_length}"
+        assert start_seq + seq_len <= self.sequence_length, f"Input Sequence Length for RoPE: (start_seq:{start_seq} + seq_len:{seq_len}){start_seq + seq_len} should be <= The initialized Sequence Length: {self.sequence_length}"
         # create angles
-        sin_angles = self.sin_angles[:, :seq_len].to(device=x.device, dtype=x.dtype)   # [:,:seq_len] not [:seq_len] because we unsqueezed so, dim: (1, max_seq_len, dim)
-        cos_angles = self.cos_angles[:, :seq_len].to(device=x.device, dtype=x.dtype)
+        sin_angles = self.sin_angles[:, start_seq:start_seq+seq_len].to(device=x.device, dtype=x.dtype)   # [:,:seq_len] not [:seq_len] because we unsqueezed so, dim: (1, max_seq_len, dim)
+        cos_angles = self.cos_angles[:, start_seq:start_seq+seq_len].to(device=x.device, dtype=x.dtype)
         return self._rotation(x, sin_angles, cos_angles)
 
 
@@ -143,7 +143,7 @@ class CausalMultiHeadAttention(nn.Module):
             if config.Table_embds_per_layer: self.ve = nn.Embedding(config.vocab_size, self.head_sz * self.n_kv_head)
             self.ve_gate = nn.Linear(self.n_embd_ve_gate, self.n_kv_head, bias=False)
 
-    def forward(self, x, char, x_ve_input):  # x -> (B, T, E)     | x_ve_input -> (token_indicies: in case of there is a ve_embd_table_per_layer),
+    def forward(self, x, char, x_ve_input, kv_cache=None):  # x -> (B, T, E)     | x_ve_input -> (token_indicies: in case of there is a ve_embd_table_per_layer),
         """Run one attention block: QKV projection, value-residual injection, RoPE, then
         either full (char='L') or sliding-window (char='S') causal attention."""
         # shapes                                                               -> (ve_embeddings: in case of there is a Global ve_embd_table)
@@ -170,26 +170,47 @@ class CausalMultiHeadAttention(nn.Module):
         v = v.transpose(1, 2)                 # -> (B, n_kv_head, T, head_sz)
 
         # apply RoPE
-        q, k = self.rope(q), self.rope(k)
+        if kv_cache is not None: q, k = self.rope(q, kv_cache.n_tokens), self.rope(k, kv_cache.n_tokens)
+        else:   q, k = self.rope(q), self.rope(k)
 
         # Normalization & Rescaling
         q, k = norm(q), norm(k)
         q, k = q * 1.2, k * 1.2
 
-        # Run FlashAttention (IF char == L)
-        if char == 'L':
-            wei = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)      # enable_gqa=True -> is more efficient that reshaping and expanding ourselves
-            wei = wei.transpose(1, 2).reshape(b, t, c)                                          # Combine the heads back
+        # KV Cache
+        if kv_cache is not None:
+            kv_cache.insert(k, v, char, t)
+            valid = kv_cache.valid + t
+            if char == 'S':
+                k = kv_cache.k_s[kv_cache.pos_s - 1, :, :, :valid]
+                v = kv_cache.v_s[kv_cache.pos_s - 1, :, :, :valid]
+            else: # 'L'
+                k = kv_cache.k_l[kv_cache.pos_l - 1, :, :, :valid]
+                v = kv_cache.v_l[kv_cache.pos_l - 1, :, :, :valid]
 
-        # Run FlashAttention (IF char == S)
-        if char == 'S':
-            if self.use_flash_attn_func_flag:
-                from flash_attn import flash_attn_func  # imported lazily: only required if this flag is actually turned on
-                q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)               # Because the flash_attn_func expects -> (B, T, n_head, head_sz) not (B, n_head, T, head_sz)
-                wei = flash_attn_func(q, k, v, causal=True, window_size=(self.window_size, 0))  # (left=window, right=0) -> only look back window tokens, never forward | causal=True is already what blocks future tokens but Both together are redundant but harmless.
-                wei = wei.reshape(b, t, c)
+            kv_len = k.shape[2]
+            if kv_len == t:  wei = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
             else:
-                wei = sliding_window_attn(q, k, v, self.group_sz, self.window_mask[:t, :t])
+                i = torch.arange(t, device= q.device).unsqueeze(1) + (kv_len - t)  # unsqueezing to enable Broadcasting
+                j = torch.arange(kv_len, device= q.device).unsqueeze(0)            # unsqueezing to enable Broadcasting
+                mask = j <= i
+                wei = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=True)
+            wei = wei.transpose(1, 2).reshape(b, t, c)
+        else:
+            # Run FlashAttention (IF char == L)
+            if char == 'L':
+                wei = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)      # enable_gqa=True -> is more efficient that reshaping and expanding ourselves
+                wei = wei.transpose(1, 2).reshape(b, t, c)                                          # Combine the heads back
+
+            # Run FlashAttention (IF char == S)
+            if char == 'S':
+                if self.use_flash_attn_func_flag:
+                    from flash_attn import flash_attn_func  # imported lazily: only required if this flag is actually turned on
+                    q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)               # Because the flash_attn_func expects -> (B, T, n_head, head_sz) not (B, n_head, T, head_sz)
+                    wei = flash_attn_func(q, k, v, causal=True, window_size=(self.window_size, 0))  # (left=window, right=0) -> only look back window tokens, never forward | causal=True is already what blocks future tokens but Both together are redundant but harmless.
+                    wei = wei.reshape(b, t, c)
+                else:
+                    wei = sliding_window_attn(q, k, v, self.group_sz, self.window_mask[:t, :t])
                 wei = wei.transpose(1, 2).reshape(b, t, c)                                       # Combine the heads back
 
         # return the projection
@@ -203,7 +224,7 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, config.mpl_expantion_term * config.n_embd, bias=False)
+        self.c_fc = nn.Linear(config.n_embd, config.mpl_expantion_term * config.n_embd,   bias=False)
         self.c_proj = nn.Linear(config.mpl_expantion_term * config.n_embd, config.n_embd, bias=False)
         self.c_proj.INIT_SPECIAL_STD = 1
 
@@ -222,11 +243,76 @@ class Block(nn.Module):
         self.attn = CausalMultiHeadAttention(config, idx, rope)
         self.mlp = MLP(config)
 
-    def forward(self, x, char, x_ve_input=None):
+    def forward(self, x, char, x_ve_input=None, kv_cache=None):
         """Pre-norm residual attention, then pre-norm residual MLP."""
-        x = x + self.attn(norm(x), char, x_ve_input)
+        x = x + self.attn(norm(x), char, x_ve_input, kv_cache)
         return x + self.mlp(norm(x))
 
+
+# ----- KV cache -----------
+class KVCache:
+    """Pre-allocated K/V buffers for every layer: sliding (S) buffers keep the last window_size tokens,
+    full (L) buffers keep up to max_seq_len. One buffer slot per layer, indexed by call order."""
+    def __init__(self, batch_size, patterns, window_size, max_seq_len, n_kv_head, n_embd, n_head, device, dtype):
+        """Allocate zeroed K/V buffers for each S/L slot and reset all positions/counters."""
+        n_s, n_l = patterns.count('S'), patterns.count('L')
+        head_dim = n_embd // n_head
+        self.window_size = window_size
+        self.max_seq_len = max_seq_len
+        shape_s = (n_s, batch_size, n_kv_head, window_size + 1, head_dim) # (window_size + 1) --bec-> mask is (rows - cols) <= window_size
+        shape_l = (n_l, batch_size, n_kv_head, max_seq_len, head_dim)
+        self.k_s = torch.zeros(shape_s, device=device, dtype=dtype)
+        self.v_s = torch.zeros(shape_s, device=device, dtype=dtype)
+        self.k_l = torch.zeros(shape_l, device=device, dtype=dtype)
+        self.v_l = torch.zeros(shape_l, device=device, dtype=dtype)
+        self.pos_s = 0
+        self.pos_l = 0
+        self.n_tokens = 0
+
+    def insert(self, added_k, added_v, pattern_char, n_added_tokens):
+        """Write one layer's new K/V into its buffer slot. S buffers roll (only the last
+        window_size tokens survive); L buffers just fill up. added_k/added_v -> (B, n_kv_head, t, head_dim)."""
+        if pattern_char == 'S':
+            k_buf, v_buf, pos, cap = self.k_s, self.v_s, self.pos_s, self.window_size + 1
+        else:  # 'L'
+            k_buf, v_buf, pos, cap = self.k_l, self.v_l, self.pos_l, self.max_seq_len
+            assert (min(self.n_tokens,cap) + n_added_tokens) <= cap, "L-type buffer overflowed — full-attention layer tried to evict, which should never happen"
+
+        valid = self.valid = min(self.n_tokens, cap)          # tokens actually stored so far | also Used in Attention.forward for slicing
+        tot_tokens = valid + n_added_tokens
+
+        if n_added_tokens >= cap:
+            # the new tokens alone overflow the buffer -> keep only their tail
+            k_buf[pos] = added_k[:, :, -cap:]
+            v_buf[pos] = added_v[:, :, -cap:]
+        elif tot_tokens > cap:
+            # drop the oldest, keep the rest, append the new
+            n_keep = cap - n_added_tokens
+            k_old = k_buf[pos, :, :, valid - n_keep:valid]
+            v_old = v_buf[pos, :, :, valid - n_keep:valid]
+            k_buf[pos] = torch.cat([k_old, added_k], dim=2)
+            v_buf[pos] = torch.cat([v_old, added_v], dim=2)
+        else:
+            # buffer still has room -> write into the next free slots
+            k_buf[pos, :, :, valid:tot_tokens] = added_k
+            v_buf[pos, :, :, valid:tot_tokens] = added_v
+
+        if pattern_char == 'S':
+            self.pos_s += 1
+        else:
+            self.pos_l += 1
+
+    def advance(self, n_added_tokens):
+        """Move the global token counter after one full forward pass; buffer positions reset for the next pass."""
+        self.n_tokens += n_added_tokens
+        self.pos_s = 0
+        self.pos_l = 0
+
+    def reset(self, clear_tokens=True):
+        """Reset buffer positions; optionally clear the token counter too."""
+        self.pos_s = 0
+        self.pos_l = 0
+        if clear_tokens: self.n_tokens = 0
 
 # 4. ---------- GPT ------------
 
@@ -320,7 +406,15 @@ class GPT(nn.Module):
                 self.resid_lambdas.data[i] = 1.15 - (0.10 * i / max(n_layer - 1, 1))
                 self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
 
-    def forward(self, x, targets=None):  # x -> (B, Tokens)
+    def get_model_device(self):
+        """Return the device the model parameters live on."""
+        return next(self.parameters()).device
+
+    def get_model_dtype(self):
+        """Return the dtype the model parameters use."""
+        return next(self.parameters()).dtype
+
+    def forward(self, x, targets=None, kv_cache=None):  # x -> (B, Tokens)
         """Full forward pass: embed -> smear -> N transformer blocks (with per-layer
         resid/x0 scalars and optional backout) -> final norm -> lm_head -> softcap ->
         optional loss if targets are given."""
@@ -349,10 +443,12 @@ class GPT(nn.Module):
             x0_lambdas = self.x0_lambdas[i].repeat_interleave(self.repetition)
             x = resid_lambdas * x + x0_lambdas * x0
             # Pass through layer
-            x = layer(x, char, x_ve_input)
+            x = layer(x, char, x_ve_input, kv_cache)
             # Backout
             if self.config.backout_flag:
                 if i == (self.backout_layer - 1): x_backout = x.clone()
+
+        if kv_cache is not None: kv_cache.advance(T)
         # Backout
         if self.config.backout_flag:
             if self.config.backout_proj_flag: x_backout = self.backout_proj(x_backout)

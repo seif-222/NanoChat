@@ -111,6 +111,9 @@ class GPT_config:
     # Use Flash Attention
     use_flash_attn_func_flag: bool = False
 
+    # KV Cache
+    kv_cache_flag: bool = True
+
     # -------------------- Weights & Biases --------------------
     use_wandb: bool = True
     wandb_project: str = 'Nanochat'
