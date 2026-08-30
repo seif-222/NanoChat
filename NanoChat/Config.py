@@ -54,9 +54,10 @@ class GPT_config:
     val_after_step: int = 500
     val_loss_accum_steps: int = 5
     hellaswag_max_examples: Optional[int] = 1000
-    hellaswag_eval_batch_size: int = 32     # examples per forward pass during hellaswag eval (=4x rows/pass); higher = fewer host-device syncs
+    hellaswag_eval_batch_size: int = 32        # examples per forward pass during hellaswag eval (=4x rows/pass); higher = fewer host-device syncs
     checkpoint_after_steps: int = 200
     clip_grad_norm_value: float = 1.0     # clip grad_norm during training
+    ignore_index: int = -100                   # in the F.cross_entropy in GPT.forward
 
     # -------------------- checkpoint / resume --------------------
     resume_from: Optional[str] = None       # path to a model_checkpoint_step_*.pt file to resume training from
@@ -110,9 +111,6 @@ class GPT_config:
 
     # Use Flash Attention
     use_flash_attn_func_flag: bool = False
-
-    # KV Cache
-    kv_cache_flag: bool = True
 
     # -------------------- Weights & Biases --------------------
     use_wandb: bool = True

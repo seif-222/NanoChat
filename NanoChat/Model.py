@@ -179,21 +179,14 @@ class CausalMultiHeadAttention(nn.Module):
 
         # KV Cache
         if kv_cache is not None:
-            kv_cache.insert(k, v, char, t)
-            valid = kv_cache.valid + t
-            if char == 'S':
-                k = kv_cache.k_s[kv_cache.pos_s - 1, :, :, :valid]
-                v = kv_cache.v_s[kv_cache.pos_s - 1, :, :, :valid]
-            else: # 'L'
-                k = kv_cache.k_l[kv_cache.pos_l - 1, :, :, :valid]
-                v = kv_cache.v_l[kv_cache.pos_l - 1, :, :, :valid]
-
+            k, v = kv_cache.insert(k, v, char, t)
             kv_len = k.shape[2]
-            if kv_len == t:  wei = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+            if char == 'L' and kv_len == t:
+                wei = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)  # fused fast path — safe for L, length-independent
             else:
-                i = torch.arange(t, device= q.device).unsqueeze(1) + (kv_len - t)  # unsqueezing to enable Broadcasting
-                j = torch.arange(kv_len, device= q.device).unsqueeze(0)            # unsqueezing to enable Broadcasting
-                mask = j <= i
+                i = torch.arange(t, device=q.device).unsqueeze(1) + (kv_len - t)
+                j = torch.arange(kv_len, device=q.device).unsqueeze(0)
+                mask = (j <= i) & (i - j <= self.window_size) if char == 'S' else j <= i
                 wei = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=True)
             wei = wei.transpose(1, 2).reshape(b, t, c)
         else:
@@ -268,6 +261,7 @@ class KVCache:
         self.pos_s = 0
         self.pos_l = 0
         self.n_tokens = 0
+        self.smear_cache = None     # The lastest token -> to apply smear gate at token by token generation
 
     def insert(self, added_k, added_v, pattern_char, n_added_tokens):
         """Write one layer's new K/V into its buffer slot. S buffers roll (only the last
@@ -278,41 +272,29 @@ class KVCache:
             k_buf, v_buf, pos, cap = self.k_l, self.v_l, self.pos_l, self.max_seq_len
             assert (min(self.n_tokens,cap) + n_added_tokens) <= cap, "L-type buffer overflowed — full-attention layer tried to evict, which should never happen"
 
-        valid = self.valid = min(self.n_tokens, cap)          # tokens actually stored so far | also Used in Attention.forward for slicing
-        tot_tokens = valid + n_added_tokens
-
-        if n_added_tokens >= cap:
-            # the new tokens alone overflow the buffer -> keep only their tail
-            k_buf[pos] = added_k[:, :, -cap:]
-            v_buf[pos] = added_v[:, :, -cap:]
-        elif tot_tokens > cap:
-            # drop the oldest, keep the rest, append the new
-            n_keep = cap - n_added_tokens
-            k_old = k_buf[pos, :, :, valid - n_keep:valid]
-            v_old = v_buf[pos, :, :, valid - n_keep:valid]
-            k_buf[pos] = torch.cat([k_old, added_k], dim=2)
-            v_buf[pos] = torch.cat([v_old, added_v], dim=2)
-        else:
-            # buffer still has room -> write into the next free slots
-            k_buf[pos, :, :, valid:tot_tokens] = added_k
-            v_buf[pos, :, :, valid:tot_tokens] = added_v
-
-        if pattern_char == 'S':
-            self.pos_s += 1
-        else:
-            self.pos_l += 1
+        valid = min(self.n_tokens, cap)          # tokens actually stored so far
+        # old KV
+        old_k = k_buf[pos, :, :, :valid]
+        old_v = v_buf[pos, :, :, :valid]
+        # returned KV
+        returned_k = torch.cat([old_k, added_k], dim=-2)
+        returned_v = torch.cat([old_v, added_v], dim=-2)
+        # new KV
+        new_k = returned_k[:, :, -cap:]
+        new_v = returned_v[:, :, -cap:]
+        k_buf[pos, :, :, :new_k.shape[-2]] = new_k
+        v_buf[pos, :, :, :new_v.shape[-2]] = new_v
+        # advance position
+        if pattern_char == 'S': self.pos_s += 1
+        else: self.pos_l += 1
+        # Return
+        return returned_k, returned_v
 
     def advance(self, n_added_tokens):
         """Move the global token counter after one full forward pass; buffer positions reset for the next pass."""
         self.n_tokens += n_added_tokens
         self.pos_s = 0
         self.pos_l = 0
-
-    def reset(self, clear_tokens=True):
-        """Reset buffer positions; optionally clear the token counter too."""
-        self.pos_s = 0
-        self.pos_l = 0
-        if clear_tokens: self.n_tokens = 0
 
 # 4. ---------- GPT ------------
 
@@ -431,9 +413,19 @@ class GPT(nn.Module):
 
         # Smear Gate
         if self.config.smear_gate_flag:
-            gate = torch.sigmoid(self.smear_gate(x[:, 1:, :self.config.n_embd_smear_gate]))
-            prev = F.pad(self.smear_lambda * gate * x[:, :-1], (0, 0, 1, 0))  # can't do x[:,1:] += ... directly — in-place ops corrupt autograd's tape, backward would read mutated values instead of originals → wrong gradients
-            x = x + prev
+            smear_cache = None   # This is the cache for the current pass
+            if kv_cache is not None:
+                smear_cache = kv_cache.smear_cache
+                kv_cache.smear_cache = x[:, -1:].clone()   # save the next cache
+            if smear_cache is None:
+                gate = torch.sigmoid(self.smear_gate(x[:, 1:, :self.config.n_embd_smear_gate]))
+                prev = F.pad(self.smear_lambda * gate * x[:, :-1], (0, 0, 1, 0))  # can't do x[:,1:] += ... directly — in-place ops corrupt autograd's tape, backward would read mutated values instead of originals → wrong gradients
+                x = x + prev
+            else:
+                x_prev = torch.cat([smear_cache, x[:,:-1]], dim=1) if T > 1  else smear_cache
+                gate = torch.sigmoid(self.smear_gate(x[:, :, :self.config.n_embd_smear_gate]))
+                prev = self.smear_lambda * gate * x_prev
+                x = x + prev
 
         # Pass Input in Transformer Layers
         x0 = x.clone()  # Save x0
@@ -465,8 +457,7 @@ class GPT(nn.Module):
         logits = logits.float()
 
         # Return Loss, Logits
-        loss = None
-        if targets is not None: loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1))
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1), ignore_index=self.config.ignore_index) if targets is not None else None
         return logits, loss
 
     def optimizers_config(self, device_type, optimizer=None):

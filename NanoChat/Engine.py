@@ -70,7 +70,7 @@ class InferenceEngine:
         # -- Top P --
         if top_p is not None:
             assert 0 <= top_p <= 1, f"Top P: {top_p}, can't be negative or more than 1"
-            sorted_logits, sorted_indices = torch.sorted(logits, descending=True, dim=-1)
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
             probs = F.softmax(sorted_logits, dim=-1)
             cum_probs = torch.cumsum(probs, dim=-1)
             removed = cum_probs > top_p                   # True -> removed
@@ -91,7 +91,9 @@ class InferenceEngine:
         B = promt_tokens.shape[0]
         # -- create KV-cache --
         if not continue_conversation: self.new_session(B)
-        else: assert self.kv_cache is not None, "continue_conversation=True but no session exists — call generate() with continue_conversation=False first"
+        else:
+            assert self.kv_cache is not None, "continue_conversation=True but no session exists — call generate() with continue_conversation=False first"
+            assert self.kv_cache.n_tokens + promt_tokens.shape[1] <= self.seq_length, f"chunk of {promt_tokens.shape[1]} tokens won't fit: {self.kv_cache.n_tokens}/{self.seq_length} used"
         # -- get logits --
         logits = self.prefill(promt_tokens)
         # -- output --
@@ -124,7 +126,9 @@ class InferenceEngine:
         """To stream the response while it is made so user don't have to wait"""
         B = promt_tokens.shape[0]
         if not continue_conversation:  self.new_session(B)
-        else: assert self.kv_cache is not None, "continue_conversation=True but no session exists — call generate() with continue_conversation=False first"
+        else:
+            assert self.kv_cache is not None, "continue_conversation=True but no session exists — call generate() with continue_conversation=False first"
+            assert self.kv_cache.n_tokens + promt_tokens.shape[1] <= self.seq_length, f"chunk of {promt_tokens.shape[1]} tokens won't fit: {self.kv_cache.n_tokens}/{self.seq_length} used"
         if eos_token is not None and pad_token_id is None: pad_token_id = eos_token
         logits = self.prefill(promt_tokens)
         recent = promt_tokens

@@ -144,7 +144,7 @@ class RustTokenizer:
             messages = conversation['messages']
             assert messages[1]['role'] == 'user', "System message must be followed by a user message"
             messages[1]['content'] = messages[0]['content'] + "\n\n" + messages[1]['content']
-            message = messages[1:]
+            messages = messages[1:]
 
         else: messages = conversation['messages']
         assert len(messages) >= 1, f"Conversation has less than 1 message: {messages}"
