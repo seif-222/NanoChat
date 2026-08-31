@@ -57,7 +57,6 @@ class GPT_config:
     hellaswag_eval_batch_size: int = 32        # examples per forward pass during hellaswag eval (=4x rows/pass); higher = fewer host-device syncs
     checkpoint_after_steps: int = 200
     clip_grad_norm_value: float = 1.0     # clip grad_norm during training
-    ignore_index: int = -100                   # in the F.cross_entropy in GPT.forward
 
     # -------------------- checkpoint / resume --------------------
     resume_from: Optional[str] = None       # path to a model_checkpoint_step_*.pt file to resume training from
@@ -111,6 +110,21 @@ class GPT_config:
 
     # Use Flash Attention
     use_flash_attn_func_flag: bool = False
+
+
+    # -------------------- SFT --------------------
+    sft_data_path: str = '/data/sft_conversations.jsonl'
+    sft_pretrained_ckpt: str = '/data/log/model_checkpoint_step_02199.pt'
+    sft_log_dir: str = 'log_sft'
+    sft_bs: int = 16                             # micro batch, in conversations not tokens
+    sft_grad_accum_mini_batches: int = 1         # bump if you want gradient accumulation
+    sft_val_fraction: float = 0.02
+    sft_split_seed: int = 1337
+    sft_desired_epochs: float = 3
+    sft_warmup_frac: float = 0.075          # 7.5% of max_steps, middle of the 5-10% rule of thumb
+    sft_lr_scale: float = 0.1               # applied to matrix/unembedding/embedding/scalar lr
+    ignore_index: int = -100                     # in the F.cross_entropy in GPT.forward
+
 
     # -------------------- Weights & Biases --------------------
     use_wandb: bool = True
