@@ -154,4 +154,33 @@ def train_model(model, train_dl, step, device, device_type, optimizer, lr_ratio_
 
 
 
+# ----- Chat-format sampling (for SFT/RL,etc...) ------
+def sample_chat(model, enc, prompts, max_new_tokens, device, device_type, process_rank):
+    """Like `sample()`, but renders each prompt through the real chat template
+    (render_for_completion) and greedy-decodes, stopping at <|assistant_end|>,
+    instead of raw string continuation to a fixed length. This is what actually
+    shows whether SFT learned the format -- val loss and HellaSwag don't."""
+    model.eval()
+    assistant_end_id = enc.encode_special("<|assistant_end|>")
+    decoded_samples = []
+    for prompt in prompts:
+        convo = {"messages": [{"role": "user", "content": prompt},
+                               {"role": "assistant", "content": ""}]}  # dummy turn -- render_for_completion pops it before rendering
+        ids = enc.render_for_completion(convo)
+        x_gen = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
+        start_len = x_gen.shape[1]
+        for _ in range(max_new_tokens):
+            if x_gen.shape[1] >= model.config.block_size: break  # context-full guard
+            with torch.no_grad():
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, _ = model(x_gen)
+                next_id = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+            x_gen = torch.cat((x_gen, next_id), dim=1)
+            if next_id.item() == assistant_end_id: break
+        gen_ids = x_gen[0, start_len:].tolist()
+        if gen_ids and gen_ids[-1] == assistant_end_id: gen_ids = gen_ids[:-1]
+        decoded = enc.decode(gen_ids)
+        decoded_samples.append((prompt, decoded))
+        print(f"Rank: {process_rank} | Q: {prompt!r} -> A: {decoded!r}")
+    return decoded_samples
 

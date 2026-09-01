@@ -114,7 +114,7 @@ class GPT_config:
 
     # -------------------- SFT --------------------
     sft_data_path: str = '/data/sft_conversations.jsonl'
-    sft_pretrained_ckpt: str = '/data/log/model_checkpoint_step_02199.pt'
+    sft_pretrained_ckpt: str = '/data/checkpoints/model_checkpoint_step_02199.pt'
     sft_log_dir: str = 'log_sft'
     sft_bs: int = 16                             # micro batch, in conversations not tokens
     sft_grad_accum_mini_batches: int = 1         # bump if you want gradient accumulation
@@ -123,8 +123,10 @@ class GPT_config:
     sft_desired_epochs: float = 3
     sft_warmup_frac: float = 0.075          # 7.5% of max_steps, middle of the 5-10% rule of thumb
     sft_lr_scale: float = 0.1               # applied to matrix/unembedding/embedding/scalar lr
+    sft_val_after_frac: float = 0.05        # validate every 5% of total SFT steps (pretrain's val_after_step=500 is way off scale for a ~4-5k step SFT run)
+    sft_checkpoint_after_frac: float = 0.10 # periodic checkpoint every 10% of total SFT steps
+    sft_best_ckpt_min_delta: float = 0.001  # only overwrite model_checkpoint_best.pt if val loss improves by at least this much -- val loss on a small eval slice is noisy, this stops it re-saving on noise
     ignore_index: int = -100                     # in the F.cross_entropy in GPT.forward
-
 
     # -------------------- Weights & Biases --------------------
     use_wandb: bool = True
