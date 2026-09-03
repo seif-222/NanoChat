@@ -487,6 +487,7 @@ class GPT(nn.Module):
         groups, assigned = [], set()
 
         def add_group(names, **kwargs):
+            names = sorted(names)   # deterministic (alphabetical) order: the positional momentum list must not depend on set/hash iteration order across processes
             params = [named[n] for n in names if n in named]
             if params:
                 groups.append(dict(params=params, **kwargs))

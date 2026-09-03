@@ -44,16 +44,37 @@ class MuonAdamW:
         return {'i': self.i, 'state': state}
 
     def load_state_dict(self, state_dict):
-        """Restore each parameter's raw momentum attributes from state_dict(), in the same group/param order."""
+        """Restore each param's momentum, matching saved entries to params by
+        shape whenever the positional order doesn't line up (the Muon group is
+        built from a set, so its order can differ between processes)."""
         self.i = state_dict['i']
-        idx = 0
-        for g in self.params:
-            for p in g['params']:
-                s = state_dict['state'][idx]
-                if 'grad_avg' in s: p.grad_avg = s['grad_avg']
-                if 'grad_sqr_avg' in s: p.grad_sqr_avg = s['grad_sqr_avg']
-                if 'v_mean_avg' in s: p.v_mean_avg = s['v_mean_avg']
-                idx += 1
+        params_flat = [p for g in self.params for p in g['params']]
+        state_list  = state_dict['state']
+        if len(params_flat) != len(state_list): raise ValueError(f"optimizer state has {len(state_list)} entries but the model has {len(params_flat)} params")
+
+        def _apply_state(p, s):
+            if 'grad_avg' in s: p.grad_avg = s['grad_avg']
+            if 'grad_sqr_avg' in s: p.grad_sqr_avg = s['grad_sqr_avg']
+            if 'v_mean_avg' in s: p.v_mean_avg = s['v_mean_avg']
+
+        # fast path: positional order matches (state restores exactly)
+        aligned = all(
+            ('grad_avg' not in s) or tuple(s['grad_avg'].shape) == tuple(p.shape)
+            for p, s in zip(params_flat, state_list)
+        )
+        if aligned:
+            for p, s in zip(params_flat, state_list):  _apply_state(p, s)
+            return
+
+        # fallback: give each entry to the first same-shaped param not yet taken
+        used = set()
+        for p in params_flat:
+            for i, s in enumerate(state_list):
+                if i in used: continue
+                if 'grad_avg' in s and tuple(s['grad_avg'].shape) == tuple(p.shape):
+                    _apply_state(p, s)
+                    used.add(i)
+                    break
 
     def step(self, lr_mult=1.):
         """Run one optimizer step across every param group, scaling each group's
