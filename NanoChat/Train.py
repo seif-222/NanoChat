@@ -93,7 +93,7 @@ log_file = os.path.join(log_dir, 'log.txt')
 def try_resume(path):
     """Try loading a full checkpoint. Returns start_step on success, None if it fails (so we can try an older one)."""
     try:
-        ckpt = torch.load(path, map_location=config.device)
+        ckpt = torch.load(path, map_location=config.device, weights_only=False)   # weights_only=False
         raw_model.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
         train_dl.load_state_dict(ckpt['train_dl'])
@@ -137,10 +137,11 @@ if config.use_wandb and master_process:
 
 ##_____________________________________  TRAINING  ______________________________________
 
+
 # Training Loop
-for step in range(start_step, config.training_steps):
+for step in range(start_step, config.training_steps + 1):
     start = time.time()
-    last_step = (step == config.training_steps - 1)
+    last_step = (step == config.training_steps)
 
     # 1. ---- Validation ----
     val_accum_loss = None

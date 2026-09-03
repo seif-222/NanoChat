@@ -65,7 +65,7 @@ attrs = ('sft_data_path', 'sft_pretrained_ckpt', 'sft_log_dir', 'sft_bs', 'sft_g
          'sft_val_fraction', 'sft_split_seed', 'sft_desired_epochs', 'sft_warmup_frac', 'sft_lr_scale',
          'sft_val_after_frac', 'sft_checkpoint_after_frac', 'sft_best_ckpt_min_delta')
 for f in attrs:
-    if not hasattr(config, f): setattr(config, f, getattr(_base_cfg, f))
+    setattr(config, f, getattr(_base_cfg, f))
 config.sft_data_path = os.environ.get('SFT_DATA_PATH', config.sft_data_path)  # Modal override, falls back to Config.py default
 
 # 3. ---- Scale LRs down for FineTuning --
@@ -155,8 +155,8 @@ if config.use_wandb and master_process:
 ##_____________________________________  TRAINING  ______________________________________
 
 best_val_loss = float('inf')
-for step in range(start_step, config.training_steps):
-    last_step = (step == config.training_steps - 1)
+for step in range(start_step, config.training_steps + 1):
+    last_step = (step == config.training_steps)
 
     val_accum_loss = None
     if step % config.val_after_step == 0 or last_step:

@@ -121,7 +121,7 @@ def train_model_ddp_remote(nproc: int = 2):
 def train_sft_remote(pretrain_checkpoint: str = "", data_path: str = ""):
     """Runs train_sft.py against a pretrained checkpoint + SFT data already sitting
     in the volume. Both args are optional -- leave blank to fall back to whatever
-    Config.py's defaults resolve to (/data/log/model_checkpoint_step_02199.pt and
+    Config.py's defaults resolve to (/data/checkpoints/model_checkpoint_step_03750.pt and
     /data/sft_conversations.jsonl respectively); pass them to override without
     touching Config.py. Timeout is a safety ceiling only -- Modal doesn't bill for
     unused timeout, only actual runtime, so it costs nothing to leave generous."""
@@ -164,9 +164,9 @@ def main(stage: str = "data", nproc: int = 2, checkpoint: str = "", data_path: s
       modal run modal_app.py --stage data
       modal run modal_app.py --stage train
       modal run modal_app.py --stage train_ddp --nproc 2
-      modal run modal_app.py --stage train_sft --checkpoint model_checkpoint_step_02199.pt
-      modal run modal_app.py --stage train_sft --checkpoint model_checkpoint_step_02199.pt --data-path my_other_sft_set.jsonl
-      modal run modal_app.py --stage final_eval --checkpoint model_checkpoint_step_02199.pt
+      modal run modal_app.py --stage train_sft --checkpoint model_checkpoint_step_03750.pt
+      modal run modal_app.py --stage train_sft --checkpoint model_checkpoint_step_03750.pt --data-path my_other_sft_set.jsonl
+      modal run modal_app.py --stage final_eval --checkpoint model_checkpoint_step_03750.pt
     """
     if stage == "data":
         download_data_remote.remote()
