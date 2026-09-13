@@ -37,6 +37,8 @@ image = (
     .add_local_file("train_utils.py", "/root/nanochat/train_utils.py")
     .add_local_file("Train.py", "/root/nanochat/Train.py")
     .add_local_file("train_sft.py", "/root/nanochat/train_sft.py")
+    .add_local_file("Engine.py", "/root/nanochat/Engine.py")
+    .add_local_file("train_rl.py", "/root/nanochat/train_rl.py")
 )
 
 MOUNT_PATH = "/data"
@@ -142,6 +144,28 @@ def train_sft_remote(pretrain_checkpoint: str = "", data_path: str = ""):
     volumes=VOLUMES,
     gpu="A100-80GB",
     cpu=(4, 8),
+    memory=(32768, 65536),
+    timeout=60 * 60 * 4,
+)
+def train_rl_remote():
+    """Runs train_rl.py. Paths come from Config.py (/data/RL jsonl, SFT best, tokenizer)."""
+    import subprocess
+    try:
+        subprocess.run(
+            ["python", "train_rl.py"],
+            cwd="/root/nanochat",
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            check=True,
+        )
+    finally:
+        volume.commit()
+
+
+@app.function(
+    image=image,
+    volumes=VOLUMES,
+    gpu="A100-80GB",
+    cpu=(4, 8),
     memory=(16384, 32768),
     timeout=60 * 60,
 )
@@ -157,7 +181,7 @@ def final_eval_remote(checkpoint: str):
 
 @app.local_entrypoint()
 def main(stage: str = "data", nproc: int = 2, checkpoint: str = "", data_path: str = ""):
-    """Local CLI entrypoint: dispatches to the data-download, training, SFT, or
+    """Local CLI entrypoint: dispatches to the data-download, training, SFT, RL, or
     final-eval function based on --stage.
 
     Examples:
@@ -166,6 +190,7 @@ def main(stage: str = "data", nproc: int = 2, checkpoint: str = "", data_path: s
       modal run modal_app.py --stage train_ddp --nproc 2
       modal run modal_app.py --stage train_sft --checkpoint model_checkpoint_step_03750.pt
       modal run modal_app.py --stage train_sft --checkpoint model_checkpoint_step_03750.pt --data-path my_other_sft_set.jsonl
+      modal run Modal_app.py --stage train_rl
       modal run modal_app.py --stage final_eval --checkpoint model_checkpoint_step_03750.pt
     """
     if stage == "data":
@@ -176,6 +201,8 @@ def main(stage: str = "data", nproc: int = 2, checkpoint: str = "", data_path: s
         train_model_ddp_remote.remote(nproc=nproc)
     elif stage == "train_sft":
         train_sft_remote.remote(pretrain_checkpoint=checkpoint, data_path=data_path)
+    elif stage == "train_rl":
+        train_rl_remote.remote()
     elif stage == "final_eval":
         final_eval_remote.remote(checkpoint=checkpoint)
     else:

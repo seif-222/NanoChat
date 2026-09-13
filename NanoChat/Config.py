@@ -127,6 +127,24 @@ class GPT_config:
     sft_best_ckpt_min_delta: float = 0.005                                # min val improvement to overwrite best
     ignore_index: int = -100                                              # CE ignore label (padding/non-assistant)
 
+    # -------------------- RL --------------------
+    rl_sft_ckpt: str = '/data/checkpoints_sft_v2/model_checkpoint_best.pt'  # SFT checkpoint RL loads (policy + frozen reference)
+    rl_gsm8k_train_path: str = '/data/RL/train.jsonl'                     # {question, answer: float} train pool
+    rl_gsm8k_test_path: str = '/data/RL/test.jsonl'                       # held-out questions used as RL val
+    rl_log_dir: str = '/data/checkpoints_rl'                              # RL checkpoints + log.txt
+    rl_prompts_per_step: int = 4                                          # distinct questions per optimizer step
+    rl_k_samples: int = 8                                                 # completions per question (the GRPO group)
+    rl_max_new_tokens: int = 256                                          # generation budget per completion
+    rl_temperature: float = 0.8                                           # training sampling; val is greedy (temp 0)
+    rl_top_p: float = 0.95                                                # training nucleus; unused at val
+    rl_lr_scale: float = 0.02                                             # extra scale on the SFT checkpoint's LRs (those already include sft_lr_scale)
+    rl_kl_beta: float = 0.02                                              # weight on KL to the frozen SFT reference
+    rl_clip_grad_norm: float = 1.0                                        # grad-norm clip
+    rl_max_steps: int = 300                                               # final step index (loop inclusive)
+    rl_checkpoint_every: int = 25                                         # save every n steps
+    rl_val_every: int = 25                                                # greedy val every n steps
+    rl_val_questions: int = 32                                            # first n test questions
+
     # -------------------- Weights & Biases --------------------
     use_wandb: bool = True                    # log to W&B
     wandb_project: str = 'Nanochat'           # project name
