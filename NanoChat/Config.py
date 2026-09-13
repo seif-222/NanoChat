@@ -19,7 +19,7 @@ class GPT_config:
     mpl_expantion_term: int = 4              # MLP hidden = n_embd * term
 
     # -------------------- data --------------------
-    bs: int = 16                             # sequences per GPU mini-batch -> one grad-accum mini-batch = bs x block_size = 16,384 tokens (for current hyper params)
+    bs: int = 16     # MINI-batch            # sequences per GPU mini-batch -> one grad-accum mini-batch = bs x block_size = 16,384 tokens (for current hyper params) [NAMING IS A BIT CONFUSING]
     tokenizer_dir: str = '/data/tokenizer'   # dir holding rustbpe_tokenizer.pkl (RustTokenizer.from_directory)
     tot_bs_for_grad_accum: int = 524288      # tokens before ONE real gradient update (all GPUs x all mini-batches) = 524,288; full training total = this x max_steps
     data_root: str = "/data/fineweb-edu_tokenized"   # pretrain shard dir
@@ -117,21 +117,21 @@ class GPT_config:
     sft_log_dir: str = 'log_sft'                                          # SFT logs/checkpoints
     sft_bs: int = 16                                                      # micro batch (conversations)
     sft_grad_accum_mini_batches: int = 1                                  # grad accumulation
-    sft_val_fraction: float = 0.02                                        # share of data -> val
+    sft_val_fraction: float = 0.01                                        # share of data -> val
     sft_split_seed: int = 1337                                            # deterministic split
     sft_desired_epochs: float = 1                                         # epochs over the train set
     sft_warmup_frac: float = 0.075                                        # warmup as fraction of max_steps
     sft_lr_scale: float = 0.1                                             # scale all base lrs down
     sft_val_after_frac: float = 0.05                                      # validate every x% of steps
     sft_checkpoint_after_frac: float = 0.10                               # save every x% of steps
-    sft_best_ckpt_min_delta: float = 0.001                                # min val improvement to overwrite best
+    sft_best_ckpt_min_delta: float = 0.005                                # min val improvement to overwrite best
     ignore_index: int = -100                                              # CE ignore label (padding/non-assistant)
 
     # -------------------- Weights & Biases --------------------
     use_wandb: bool = True                    # log to W&B
     wandb_project: str = 'Nanochat'           # project name
     wandb_entity: Optional[str] = 'seif-222-student'   # account/team
-    wandb_run_name: Optional[str] = 'Full_PreTraining_Run_cont'   # cont -> floor-LR continuation of the pretrain run (2199 -> 3750), new wandb run id
+    wandb_run_name: Optional[str] = 'Nanochat_SFT_Run'   # cont -> floor-LR continuation of the pretrain run (2199 -> 3750), new wandb run id
     wandb_run_id: Optional[str] = None        # resume id
     wandb_mode: str = 'online'                # 'online' | 'offline' | 'disabled'
     wandb_log_samples: bool = True            # log samples as a table

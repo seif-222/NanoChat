@@ -58,7 +58,7 @@ class InferenceEngine:
 
         # -- Temperature --
         if temperature == 0.0:  return logits.argmax(dim=-1, keepdim=True)
-        logits = logits / temperature                        # it Temp < 1 -> bigger gap (more deterministic), Temp < 1 -> smaller gap (less deterministic)
+        logits = logits / temperature                        # Temp < 1 -> bigger gap (more deterministic); Temp > 1 -> smaller gap (less deterministic)
 
 
         # -- Top K --

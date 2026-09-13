@@ -9,6 +9,9 @@ Sources:
   1. HuggingFaceTB/everyday-conversations-llama3.1-2k   (~2.3k, MIT-ish/permissive)
   2. HuggingFaceH4/no_robots                            (~9.5k, CC-BY-NC-4.0 -- non-commercial)
   3. databricks/databricks-dolly-15k                    (~15k,  CC-BY-SA-3.0 -- commercial ok)
+  4. HuggingFaceTB/smol-smoltalk                        (capped, Apache-2.0) -- the variant built
+     for sub-1B models (function-calling / heavy-rewrite / advanced-math slices removed).
+     NOT HuggingFaceTB/smoltalk config "all" -- that mix targets 1.7B+ models.
 """
 import os
 import json
@@ -26,6 +29,9 @@ SEED = 42
 everyday_conversations_split = 'train_sft'
 no_robots_split = 'train'
 dolly_split = 'train'
+smol_smoltalk_split = 'train'
+
+SMOL_SMOLTALK_MAX_ROWS = 300000   # cap before filtering -- expect a lower yield after too_long drops (~150000 after filtering)
 
 
 def validate(messages, source, row_idx):
@@ -102,12 +108,27 @@ def load_dolly(max_rows=None, split=dolly_split):
     return process(ds, clean, "dolly-15k")
 
 
+def load_smol_smoltalk(max_rows=SMOL_SMOLTALK_MAX_ROWS, split=smol_smoltalk_split):
+    """The broad-coverage bulk of the mixture. System turns are stripped (render_conversation
+    only merges a system message when it is literally message 0, so a stray one mid-list would
+    break the strict user/assistant alternation validate() enforces)."""
+    ds = load_dataset("HuggingFaceTB/smol-smoltalk", split=split)
+    if max_rows:
+        ds = ds.shuffle(seed=SEED).select(range(min(len(ds), max_rows)))
+    def clean(row):
+        msgs = row.get('messages')
+        if not msgs: return None
+        return [{'role': m['role'], 'content': m['content']} for m in msgs if m['role'] != 'system']
+    return process(ds, clean, "smol-smoltalk")
+
+
 def main():
     """Download + clean each source, merge, shuffle, write one JSON line per conversation."""
     all_conversations = []
     all_conversations += load_everyday_conversations()   # ~2.3k
     all_conversations += load_no_robots()                # ~9.5k
     all_conversations += load_dolly()                    # ~15k
+    all_conversations += load_smol_smoltalk()            # capped, see SMOL_SMOLTALK_MAX_ROWS
     # Shuffle
     random.seed(SEED)
     random.shuffle(all_conversations)

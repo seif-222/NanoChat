@@ -89,6 +89,7 @@ config.training_steps = config.max_steps
 config.warmup_steps = max(1, round(config.max_steps * config.sft_warmup_frac))
 config.val_after_step = max(1, round(config.max_steps * config.sft_val_after_frac))
 config.checkpoint_after_steps = max(1, round(config.max_steps * config.sft_checkpoint_after_frac))
+config.val_loss_accum_steps = max(1, len(val_dl.examples) // (val_dl.bs * ddp_world_size))
 if master_process:
     print(f"[INFO] SFT schedule: {len(train_dl.examples)} | Train examples -> {steps_per_epoch} steps/epoch x {config.sft_desired_epochs} epochs  = max_steps = {config.max_steps} | warmup_steps={config.warmup_steps}")
     print(f"[INFO] SFT val_after_step={config.val_after_step} | checkpoint_after_steps={config.checkpoint_after_steps}")
@@ -155,6 +156,8 @@ if config.use_wandb and master_process:
 ##_____________________________________  TRAINING  ______________________________________
 
 best_val_loss = float('inf')
+best_step = None
+
 for step in range(start_step, config.training_steps + 1):
     last_step = (step == config.training_steps)
 
@@ -167,6 +170,7 @@ for step in range(start_step, config.training_steps + 1):
         # separate best-checkpoint file, only overwritten on a real improvement (not val-loss noise)
         if master_process and val_accum_loss.item() < best_val_loss - config.sft_best_ckpt_min_delta:
             best_val_loss = val_accum_loss.item()
+            best_step = step
             torch.save({'step': step, 'model': raw_model.state_dict(), 'optimizer': optimizer.state_dict(),
                         'train_dl': train_dl.state_dict(), 'config': raw_model.config, 'val_loss': best_val_loss},
                        os.path.join(log_dir, 'model_checkpoint_best.pt'))
@@ -215,5 +219,7 @@ for step in range(start_step, config.training_steps + 1):
                        'train/step_time_sec': step_time}, step=step)
 
 if master_process and config.use_wandb: wandb.finish()
-if master_process: print(f"[INFO] SFT done. Checkpoints in {log_dir}")
+if master_process:
+    print(f"[INFO] SFT done. Checkpoints in {log_dir}")
+    print(f'[INFO] Best_checkpoint is at STEP: {best_step}')
 if ddp: destroy_process_group()

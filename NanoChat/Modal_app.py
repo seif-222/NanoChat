@@ -126,7 +126,7 @@ def train_sft_remote(pretrain_checkpoint: str = "", data_path: str = ""):
     touching Config.py. Timeout is a safety ceiling only -- Modal doesn't bill for
     unused timeout, only actual runtime, so it costs nothing to leave generous."""
     import subprocess
-    env = {**os.environ, "SFT_LOG_DIR": f"{MOUNT_PATH}/checkpoints_sft", "PYTHONUNBUFFERED": "1"}
+    env = {**os.environ, "SFT_LOG_DIR": f"{MOUNT_PATH}/checkpoints_sft_v2", "PYTHONUNBUFFERED": "1"}
     if pretrain_checkpoint:
         env["SFT_PRETRAIN_CKPT"] = f"{MOUNT_PATH}/checkpoints/{pretrain_checkpoint}"
     if data_path:
