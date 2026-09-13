@@ -17,3 +17,6 @@ output/Models/
 
 # Downloaded benchmark data
 HellaSwag/
+
+# Live demo UI
+website/
