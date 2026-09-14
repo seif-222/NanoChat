@@ -26,14 +26,16 @@ Inspired by Karpathy’s [nanochat](https://github.com/karpathy/nanochat) and th
 
 * Pre-norm, weightless RMSNorm
 * RoPE (base 100k)
+* QK-Norm (RMSNorm on Q/K, then ×1.2)
 * ReLU² MLP (4×)
 * Untied language-model head, zero-init output projections
 * Logit softcap
 * Sliding-window attention (`SSSL`, window 256; every 4th layer and the last layer are full) (cheaper attention, periodic full layers keep long range)
 * SmearGate (mix in the previous token)
-* Value embeddings (token identity on attention values; one small shared table)
-* Residual-stream skip + mid-stack backout
-* Muon + AdamW (Muon on matrices, AdamW on embeddings / head)
+* Value embeddings (token identity on attention values; one small shared table, every other layer)
+* Residual-stream skip (mix the first hidden state back in each layer)
+* Mid-stack backout
+* Muon + AdamW (Muon on matrices, AdamW on embeddings / head / scalars)
 
 ---
 
@@ -50,11 +52,11 @@ Custom `Engine` — this architecture does not go through vLLM or Hugging Face p
 
 ## Pretraining
 
-* FineWeb-Edu `sample-10BT`, 40 shards × 100M tokens (≈ 1.97B tokens used for this version)
+* FineWeb-Edu `sample-10BT`, 40 shards × 100M tokens = 4B tokens (≈ 1.97B tokens used for this version)
 * Custom BPE on 2B characters, GPT-4-style split
 * Chat special tokens put in the vocab up front
 
-Planned 3100-step warmup + cosine. The run died mid-way (Modal server cutoff). Last clean checkpoint was step 1500. Horizon was cut to 2200 to finish on budget — cosine is locked to `max_steps`, so that cut dropped the learning rate at the resume point (~61% of peak → ~34%), an intentional trade-off to finish annealing on budget. 1500→2199 then fully annealed (val 3.167, ~1.15B tokens). (WSD prevents this: you can train and cut without pre-planning the step count, but in this case training was already 1500 steps into cosine, so that schedule was kept.)
+Planned warmup + cosine over 3100 steps. The run died mid-way (Modal server cutoff). Last clean checkpoint was step 1500. Horizon was cut to 2200 to finish on budget — cosine is locked to `max_steps`, so that cut dropped the learning rate at the resume point (~61% of peak → ~34%), an intentional trade-off to finish annealing on budget. 1500→2199 then fully annealed (val 3.167, ~1.15B tokens). (WSD prevents this: you can train and cut without pre-planning the step count, but in this case training was already 1500 steps into cosine, so that schedule was kept.)
 
 Extra budget (a fresh $30). Val was still falling at 2199. Two options: rewind to step 1500 and finish the original 3100-step cosine, or continue from 2200 at the floor learning rate through step 3750. I chose the second — 700 steps were already trained, so more tokens seen over a cleaner schedule. `max_steps` stayed at 2200 (a new cosine aimed at 3750 would have jumped the learning rate ~4.5×). Val **3.167 → 3.121**, ~1.97B tokens ≈ **7.8 tok/param**.
 
