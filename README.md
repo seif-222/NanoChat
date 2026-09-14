@@ -137,16 +137,23 @@ Full validation split (10,042 examples):
 
 ```
 NanoChat/
-├── Model.py
-├── Engine.py
-├── Tokenizer.py
-├── optimizer.py
-├── Config.py
-├── Train.py
-├── train_sft.py
-├── train_rl.py
-├── Modal_app.py
-└── output/tokenizer/rustbpe_tokenizer.pkl
+├── Config.py              # model + training configuration
+├── Model.py               # GPT architecture + KV cache
+├── optimizer.py           # MuonAdamW
+├── Engine.py              # inference / sampling / streaming
+├── Tokenizer.py           # BPE tokenizer + chat formatting
+├── DataLoader.py          # pretraining + SFT loaders
+├── train_utils.py         # shared training utilities
+├── Train.py               # pretraining
+├── train_sft.py           # supervised fine-tuning
+├── train_rl.py            # GRPO / GSM8K
+├── prepare_sft_data.py    # SFT dataset preparation
+├── gsm8k_data.py          # GSM8K preparation
+├── Train_tokenizer.py     # tokenizer training
+├── Shard_tokenization.py  # FineWeb-Edu tokenization
+├── HellaSwag.py           # evaluation
+├── Modal_app.py           # cloud training stages
+└── output/tokenizer/rustbpe_tokenizer.pkl  # tokenizer file
 ```
 
 ## Acknowledgements
