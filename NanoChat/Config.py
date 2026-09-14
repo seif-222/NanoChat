@@ -14,7 +14,7 @@ class GPT_config:
     n_embd: int = 896                        # hidden/embedding dim
     n_head: int = 7                          # query heads
     n_layer: int = 14                        # transformer blocks
-    vocab_size: int = 50304                  # placeholder -- Train.py sets it from the tokenizer (real: 65536)
+    vocab_size: int = 65536                  # vocab_size in the tokenizer (n_tokens in tokenizer)
     block_size: int = 1024                   # context length
     mpl_expantion_term: int = 4              # MLP hidden = n_embd * term
 

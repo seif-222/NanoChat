@@ -20,3 +20,6 @@ HellaSwag/
 
 # Live demo UI
 website/
+
+# Modal public-demo extras (not training code)
+demo_files/

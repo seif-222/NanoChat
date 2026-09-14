@@ -5,7 +5,8 @@ From-scratch GPT: custom BPE → pretrain → SFT → RL (optional) → chat dem
 Inspired by Karpathy’s [nanochat](https://github.com/karpathy/nanochat) and the GPT speedrun. Same idea — plain PyTorch, no trainer frameworks — not a fork.
 
 **Demo:** [seif-222--nanochat-chat-serve.modal.run](https://seif-222--nanochat-chat-serve.modal.run) (~20 seconds cold start)
-**W&B:** [seif-222-student/Nanochat](https://wandb.ai/seif-222-student/Nanochat) (`Nanochat_SFT_Run`)
+
+**W&B:** [seif-222-student/Nanochat](https://wandb.ai/seif-222-student/Nanochat)
 
 253.2M params. ~1.97B pretrain tokens. Modal’s $30/mo free tier ($50 total, $40 useful GPU after experimentations and errors).
 
