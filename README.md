@@ -6,6 +6,8 @@ Inspired by Karpathy’s [nanochat](https://github.com/karpathy/nanochat) and th
 
 **Demo:** [seif-222--nanochat-chat-serve.modal.run](https://seif-222--nanochat-chat-serve.modal.run) (~20 seconds cold start)
 
+**Write-up:** [Training a 253M chat model from scratch](WRITEUP.md)
+
 **W&B:** [seif-222-student/Nanochat](https://wandb.ai/seif-222-student/Nanochat)
 
 253.2M params · ~1.97B pretrain tokens · ~13 hours on 1× A100-80GB · ~$40 in useful GPU compute on Modal.

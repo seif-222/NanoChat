@@ -1,7 +1,8 @@
 # Ignore everything by default
 /*
 
-# ...except the NanoChat folder, this file, and the public README
+# ...except the NanoChat folder, this file, and the public README / write-up
 !/NanoChat/
 !/.gitignore
 !/README.md
+!/WRITEUP.md
