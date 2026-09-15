@@ -8,7 +8,9 @@ Inspired by Karpathy’s [nanochat](https://github.com/karpathy/nanochat) and th
 
 **W&B:** [seif-222-student/Nanochat](https://wandb.ai/seif-222-student/Nanochat)
 
-253.2M params. ~1.97B pretrain tokens. Modal’s $30/mo free tier ($50 total, $40 useful GPU after experimentations and errors).
+253.2M params · ~1.97B pretrain tokens · ~13 hours on 1× A100-80GB · ~$40 in useful GPU compute on Modal.
+
+Distributed training is supported in the training scripts for larger-scale runs.
 
 | Stage | Status |
 | --- | --- |
