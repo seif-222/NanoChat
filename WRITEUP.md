@@ -124,7 +124,7 @@ WSD (warmup–stable–decay) would have avoided the schedule problems above. Th
 
 nanochat has a mid-training stage between pretraining and SFT. It's a broad mix that teaches the conversation format, plus multiple-choice answering and tool use. I skipped it for two reasons:
 
-- **Tool use** was out of scope, and I removed it from the SFT data anyway. Multiple-choice formatting wasn't a goal either.
+- **Tool use** was out of scope, and I removed it from the SFT data anyway (see SFT). Multiple-choice formatting wasn't a goal either.
 - **The chat format** was already covered by my SFT mix, which was diverse enough.
 
 At this scale, a separate stage that overlaps this much with SFT wasn't worth the budget.
@@ -189,12 +189,11 @@ The extra tokens at the floor learning rate added about 0.7 points (30.55% → 3
 
 **Samples:**
 
-> **User:** What is the capital of United States?
-> **Assistant:** The capital of the United States is Washington, D.C.
-
-> **User:** What is the Photosynthesis process.
-> **Assistant:** The Photosynthesis process is a process used by plants, algae, and some bacteria to convert light energy into chemical energy.
-> **User:** Is this process important?
+> **User:** What is the capital of United States?  
+> **Assistant:** The capital of the United States is Washington, D.C.  
+> **User:** What is the Photosynthesis process.  
+> **Assistant:** The Photosynthesis process is a process used by plants, algae, and some bacteria to convert light energy into chemical energy.  
+> **User:** Is this process important?  
 > **Assistant:** Yes, the process of photosynthesis is important because it provides the energy needed for all living organisms to function properly.
 
 It handles simple chats well, but for topics outside its training data it can make things up, which is expected at this scale.
@@ -230,9 +229,7 @@ Each run logs:
 
 ### My own ideas (already flags, not tested yet)
 
-- **Value embeddings.**
-  - *Two or three shared tables instead of one,* each serving part of the depth. At my current 12 dimensions each table is under 1M parameters, so this is cheap, but it gets expensive if the table dimension is increased.
-  - *A separate full-width table per layer.* Each would be 65,536 × 896 ≈ 58.7M parameters, so memory is the limit.
+- **Value embeddings.** Use two or three shared tables instead of one, each serving part of the depth. At my current 12 dimensions each table is under 1M parameters, so this is cheap, but it gets expensive if the table dimension is increased.
 - **Per-layer scalars.** Use several scalars per layer instead of one, for example 4, each covering a quarter of the dimensions.
 - **SmearGate.** Change the number of features the gate reads (currently 24).
 - **Backout.**
